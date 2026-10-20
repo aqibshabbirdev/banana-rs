@@ -13,6 +13,16 @@ walkdir = "2"
 rayon = "1"
 rfd = "0.15"
 dirs = "6"
+egui-phosphor = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HEIC/HEIF/AVIF via the system libheif (Linux: libheif-dev >= 1.17, macOS: brew install libheif).
+# Build without it: cargo build --no-default-features
+libheif-rs = { version = "3", default-features = false, features = ["v1_17", "image"], optional = true }
+
+[features]
+default = ["heic"]
+heic = ["dep:libheif-rs"]
 
 [profile.dev.package."*"]
 # Image decoding is painfully slow without optimisations, even in debug builds.

@@ -1,10 +1,15 @@
 mod app;
 mod library;
+mod store;
 mod thumbs;
 
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
+    // Teaches the `image` crate to open HEIC/HEIF/AVIF, so the rest of the app needs no changes.
+    #[cfg(feature = "heic")]
+    libheif_rs::integration::image::register_all_decoding_hooks();
+
     // `banana-rs ~/Pictures` opens that folder; otherwise the last folder, then the Pictures folder.
     let start = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_dir());
 
