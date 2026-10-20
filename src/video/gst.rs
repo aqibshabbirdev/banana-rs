@@ -11,6 +11,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_pbutils as pbutils;
+use gstreamer_pbutils::prelude::*;
 use gstreamer_video as gst_video;
 use image::{DynamicImage, RgbaImage};
 
@@ -52,7 +53,7 @@ pub fn probe(path: &Path) -> Option<VideoInfo> {
     let created = info.tags().and_then(|t| t.get::<gst::tags::DateTime>()).and_then(|v| {
         let dt = v.get();
         let date = NaiveDate::from_ymd_opt(dt.year(), dt.month()? as u32, dt.day()? as u32)?;
-        date.and_hms_opt(dt.hour().unwrap_or(0) as u32, dt.minute().unwrap_or(0) as u32, dt.seconds().unwrap_or(0) as u32)
+        date.and_hms_opt(dt.hour().unwrap_or(0) as u32, dt.minute().unwrap_or(0) as u32, dt.second().unwrap_or(0) as u32)
     });
     Some(VideoInfo { width, height, duration, created })
 }
