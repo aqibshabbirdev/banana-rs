@@ -4,6 +4,29 @@ An offline photo library written in Rust, laid out like Google Photos. Open a fo
 
 ![Photos view](docs/screenshot.png)
 
+## Install
+
+Download from the [latest release](https://github.com/aqibshabbirdev/banana-rs/releases/latest). The AI models (faces, pets, documents, search) are included, and everything runs offline.
+
+**Mac (Apple Silicon, macOS 11 or newer)**
+
+1. Download `BananaPhotos-<version>-arm64.dmg`, open it, and drag **Banana Photos** to **Applications**.
+2. The app isn't notarized by Apple, so the first time, right-click it in Applications and choose **Open**, then **Open** again. (Or run `xattr -cr "/Applications/Banana Photos.app"` in Terminal.)
+3. Click the folder button and choose where your photos are. It reads them in place and never moves or changes them.
+
+**Linux (Ubuntu 24.04+, Debian 13+; x86_64 or arm64)**
+
+```bash
+sudo apt install libheif1 libheif-plugin-libde265 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav libxkbcommon-x11-0 libgl1 libegl1 libgl1-mesa-dri
+tar xzf banana-rs-<version>-linux-x86_64.tar.gz     # or -linux-arm64
+./banana-rs-<version>-linux-x86_64/banana-rs ~/Pictures
+```
+
+Keep the `models` folder next to the `banana-rs` binary. To build it yourself instead, see [Build on Linux](#build-on-linux) and [Mac](#mac-apple-silicon-m1m4).
+
+The first time you open a folder, the app looks through every photo once (faces, pets, documents and search). This runs in the background, and the results are saved, so later launches are instant.
+
 ## Features
 
 - **Timeline**: month headings, day headings, and justified rows where photos keep their shape. Small days share a row with the next day, as in Google Photos.
@@ -29,6 +52,8 @@ Ubuntu 24.04 / Debian 13 (the `libheif-dev` they ship is 1.17 or newer, which HE
 ```bash
 sudo apt install build-essential pkg-config libheif-dev libheif-plugin-libde265 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/aqibshabbirdev/banana-rs && cd banana-rs
+scripts/fetch-models.sh        # AI models into assets/models (about 210 MB)
 cargo build --release
 ./target/release/banana-rs ~/Pictures
 ```
@@ -48,6 +73,7 @@ From a Mac, `scripts/build-linux.sh` builds the Linux binary inside Docker (Ubun
 ## Mac (Apple Silicon, M1–M4)
 
 ```bash
+git clone https://github.com/aqibshabbirdev/banana-rs && cd banana-rs
 scripts/build-macos.sh
 ```
 
