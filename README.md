@@ -79,7 +79,7 @@ scripts/build-macos.sh
 
 This builds `dist/Banana Photos.app` and `dist/BananaPhotos-<version>-arm64.dmg`. It needs only Xcode command line tools and Rust. HEIC uses macOS's own ImageIO and videos use AVFoundation (hardware decoding), so there is no libheif, GStreamer or Homebrew dependency. Open the dmg and drag the app to Applications. It runs on macOS 11 (Big Sur) or newer.
 
-The app is ad-hoc signed. On another Mac, the first launch needs right-click → **Open** (or `xattr -cr "/Applications/Banana Photos.app"`). To skip that, sign and notarize it with an Apple Developer ID: `SIGN_ID="Developer ID Application: …" scripts/build-macos.sh`, then `xcrun notarytool submit`.
+The app is ad-hoc signed. On another Mac, the first launch needs right-click → **Open** (or `xattr -cr "/Applications/Banana Photos.app"`). To skip that, sign and notarize it with an Apple Developer ID: create a **Developer ID Application** certificate (Xcode → Settings → Accounts → Manage Certificates), store notarization credentials once with `xcrun notarytool store-credentials notary`, then run `NOTARY_PROFILE=notary scripts/build-macos.sh`. The script finds the certificate in the keychain (or takes `SIGN_ID="Developer ID Application: …"`), signs the app and dmg, notarizes, and staples the ticket.
 
 Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folder, and inside an Apple Photos library (`*.photoslibrary`) only the original photos are read, not its thumbnails.
 

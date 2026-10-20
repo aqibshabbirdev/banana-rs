@@ -2,6 +2,9 @@
 # Builds "Banana Photos.app" for Apple Silicon (M1–M4) and wraps it in a .dmg.
 #   scripts/build-macos.sh            -> dist/Banana Photos.app, dist/BananaPhotos-<version>-arm64.dmg
 #   SIGN_ID="Developer ID Application: ..." scripts/build-macos.sh   to sign for distribution
+#     (picked up automatically when exactly one Developer ID Application certificate is in the keychain)
+#   NOTARY_PROFILE=notary scripts/build-macos.sh   also notarizes and staples the dmg, so it opens with
+#     no warning on any Mac. Make the profile once: xcrun notarytool store-credentials notary
 # Needs only Xcode command line tools and Rust; HEIC uses macOS's ImageIO, so nothing to bundle.
 set -euo pipefail
 
@@ -12,7 +15,18 @@ TARGET="aarch64-apple-darwin"
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 DIST="dist"
 APP="$DIST/$APP_NAME.app"
+if [ -z "${SIGN_ID:-}" ]; then
+  DEV_IDS=$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | tr -d '"' || true)
+  if [ -n "$DEV_IDS" ] && [ "$(printf '%s\n' "$DEV_IDS" | wc -l | tr -d ' ')" = 1 ]; then
+    SIGN_ID="$DEV_IDS"
+  fi
+fi
 SIGN_ID="${SIGN_ID:--}"   # "-" = ad-hoc, enough to run on this Mac and on others after "Open"
+NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+if [ -n "$NOTARY_PROFILE" ] && [ "$SIGN_ID" = "-" ]; then
+  echo "NOTARY_PROFILE needs a Developer ID Application certificate (SIGN_ID)." >&2
+  exit 1
+fi
 
 export MACOSX_DEPLOYMENT_TARGET=11.0
 rustup target add "$TARGET" >/dev/null 2>&1 || true
@@ -86,6 +100,16 @@ ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
+
+if [ "$SIGN_ID" != "-" ]; then
+  codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+fi
+if [ -n "$NOTARY_PROFILE" ]; then
+  echo "==> Notarizing (a few minutes)"
+  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$DMG"
+  spctl --assess --type open --context context:primary-signature -v "$DMG"
+fi
 
 echo
 echo "Done:"
