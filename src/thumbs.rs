@@ -1,0 +1,146 @@
+//! Background image decoding: small cached thumbnails for the grid, full-size images for the viewer.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+
+use eframe::egui::{self, ColorImage};
+use image::{DynamicImage, ImageReader};
+
+pub const THUMB_SIZE: u32 = 320;
+const FULL_MAX: u32 = 4096;
+
+pub struct Job {
+    pub gen: u64,
+    pub id: usize,
+    pub path: PathBuf,
+    /// Cache key derived from path, mtime and size, so edited files get fresh thumbnails.
+    pub key: u64,
+}
+
+pub struct Loaded {
+    pub gen: u64,
+    pub id: usize,
+    pub image: Option<ColorImage>,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// Workers pop from the back, so the most important jobs go last.
+    jobs: Vec<Job>,
+    in_flight: HashSet<(u64, usize)>,
+}
+
+pub struct ThumbLoader {
+    shared: Arc<(Mutex<Queue>, Condvar)>,
+    pub rx: Receiver<Loaded>,
+}
+
+impl ThumbLoader {
+    pub fn new(ctx: egui::Context) -> Self {
+        let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        let (tx, rx) = channel();
+        let cache = cache_dir();
+        let _ = std::fs::create_dir_all(&cache);
+
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2);
+        for _ in 0..workers {
+            let shared = shared.clone();
+            let tx: Sender<Loaded> = tx.clone();
+            let ctx = ctx.clone();
+            let cache = cache.clone();
+            std::thread::spawn(move || loop {
+                let job = {
+                    let (lock, cv) = &*shared;
+                    let mut q = lock.lock().unwrap();
+                    loop {
+                        if let Some(job) = q.jobs.pop() {
+                            q.in_flight.insert((job.gen, job.id));
+                            break job;
+                        }
+                        q = cv.wait(q).unwrap();
+                    }
+                };
+
+                let image = load_thumb(&job.path, &cache.join(format!("{:016x}.jpg", job.key)));
+                shared.0.lock().unwrap().in_flight.remove(&(job.gen, job.id));
+                if tx.send(Loaded { gen: job.gen, id: job.id, image }).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            });
+        }
+
+        Self { shared, rx }
+    }
+
+    /// Replaces the queue with exactly these jobs (least important first). Called every frame
+    /// with whatever is on screen, so photos that were scrolled past are never decoded.
+    pub fn set_wanted(&self, jobs: Vec<Job>) {
+        let (lock, cv) = &*self.shared;
+        let mut q = lock.lock().unwrap();
+        let in_flight = &q.in_flight;
+        let jobs: Vec<Job> = jobs.into_iter().filter(|j| !in_flight.contains(&(j.gen, j.id))).collect();
+        let any = !jobs.is_empty();
+        q.jobs = jobs;
+        if any {
+            cv.notify_all();
+        }
+    }
+}
+
+pub fn spawn_full(path: PathBuf, gen: u64, id: usize, tx: Sender<Loaded>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let image = decode(&path).map(|img| {
+            if img.width() > FULL_MAX || img.height() > FULL_MAX {
+                img.resize(FULL_MAX, FULL_MAX, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            }
+        });
+        let _ = tx.send(Loaded { gen, id, image: image.map(to_color_image) });
+        ctx.request_repaint();
+    });
+}
+
+pub fn cache_key(path: &Path, mtime: u64, size: u64) -> u64 {
+    // FNV-1a: stable across runs and Rust versions, unlike DefaultHasher.
+    let mut h: u64 = 0xcbf29ce484222325;
+    let bytes = path.to_string_lossy();
+    for b in bytes.as_bytes().iter().chain(&mtime.to_le_bytes()).chain(&size.to_le_bytes()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn cache_dir() -> PathBuf {
+    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("banana-rs").join("thumbs")
+}
+
+fn load_thumb(path: &Path, cached: &Path) -> Option<ColorImage> {
+    if let Ok(img) = image::open(cached) {
+        return Some(to_color_image(img));
+    }
+    let thumb = decode(path)?.thumbnail(THUMB_SIZE, THUMB_SIZE);
+    let _ = thumb.to_rgb8().save_with_format(cached, image::ImageFormat::Jpeg);
+    Some(to_color_image(thumb))
+}
+
+/// Decodes and applies the EXIF rotation, so phone photos are not shown sideways.
+fn decode(path: &Path) -> Option<DynamicImage> {
+    use image::ImageDecoder;
+    let mut decoder = ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;
+    let orientation = decoder.orientation().ok();
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    if let Some(o) = orientation {
+        img.apply_orientation(o);
+    }
+    Some(img)
+}
+
+fn to_color_image(img: DynamicImage) -> ColorImage {
+    let rgba = img.to_rgba8();
+    ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw())
+}

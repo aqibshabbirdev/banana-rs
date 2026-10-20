@@ -1,0 +1,22 @@
+[package]
+name = "banana-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Offline photo library: browse your photos grouped by date"
+
+[dependencies]
+eframe = "0.31"
+image = "0.25"
+kamadak-exif = "0.6"
+chrono = "0.4"
+walkdir = "2"
+rayon = "1"
+rfd = "0.15"
+dirs = "6"
+
+[profile.dev.package."*"]
+# Image decoding is painfully slow without optimisations, even in debug builds.
+opt-level = 3
+
+[profile.release]
+lto = "thin"
