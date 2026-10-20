@@ -15,11 +15,14 @@ use tract_onnx::prelude::*;
 pub const TEXT_MODEL: &str = "clip_text_quantized.onnx";
 pub const TOKENIZER: &str = "clip_tokenizer.json";
 
-/// Photos at least this similar to the text can be results...
-const MIN_SCORE: f32 = 0.22;
-/// ...if they are also within this much of the best match, which keeps a search for something
-/// the library clearly has from trailing off into loosely related photos.
-const BELOW_BEST: f32 = 0.05;
+/// A photo is a result when it is at least this much more similar to "a photo of <text>" than
+/// to just "a photo". Raw CLIP similarities run high for some pictures whatever the text, so
+/// the plain caption is the baseline; tuned on a mixed library, where photos of the thing
+/// searched for gain 0.02-0.08 and searches for things not in it ("giraffe", "guitar") stay below.
+const MIN_GAIN: f32 = 0.02;
+/// ...and within this much of the best match, so a search for something the library clearly
+/// has doesn't trail off into loosely related photos.
+const BELOW_BEST: f32 = 0.04;
 const MAX_RESULTS: usize = 300;
 
 /// The text model and tokenizer, if installed next to the other models.
@@ -56,6 +59,14 @@ impl TextEncoder {
         Ok(Self { tokenizer, plan })
     }
 
+    /// What search ranks photos by: the embedding of "a photo of <text>" minus that of
+    /// "a photo", so a photo's dot product with it is its gain over the baseline caption.
+    pub fn query(&self, text: &str) -> Result<Vec<f32>, String> {
+        let t = self.embed(&format!("a photo of {text}"))?;
+        let base = self.embed("a photo")?;
+        Ok(t.iter().zip(&base).map(|(a, b)| a - b).collect())
+    }
+
     /// The text's unit-length embedding. Ids are padded with the end marker to 77, like CLIP
     /// was trained: the model reads its output at the first end marker, and its causal mask
     /// keeps the padding from affecting that position.
@@ -90,7 +101,7 @@ impl QueryWorker {
                 while let Ok(newer) = jobs.try_recv() {
                     text = newer;
                 }
-                let result = encoder.as_ref().map_err(Clone::clone).and_then(|e| e.embed(&text));
+                let result = encoder.as_ref().map_err(Clone::clone).and_then(|e| e.query(&text));
                 if done.send((text, result)).is_err() {
                     break;
                 }
@@ -181,9 +192,9 @@ impl Embeddings {
     }
 }
 
-/// Indices into `candidates` of the photos that match `query`, best first.
+/// Indices into `candidates` of the photos that match `query` (from `TextEncoder::query`), best first.
 pub fn rank<'a>(query: &[f32], candidates: impl Iterator<Item = (usize, &'a Stored)>) -> Vec<usize> {
-    let mut scored: Vec<(usize, f32)> = candidates.map(|(i, s)| (i, s.dot(query))).filter(|(_, s)| *s >= MIN_SCORE).collect();
+    let mut scored: Vec<(usize, f32)> = candidates.map(|(i, s)| (i, s.dot(query))).filter(|(_, s)| *s >= MIN_GAIN).collect();
     let best = scored.iter().map(|(_, s)| *s).fold(f32::MIN, f32::max);
     scored.retain(|(_, s)| *s >= best - BELOW_BEST);
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -279,22 +290,26 @@ mod tests {
         assert!((s.dot(&a) - 1.0).abs() < 0.003);
     }
 
+    /// Photos whose gain over the baseline caption is `gains` (query = text - baseline).
+    fn photos_with_gains(gains: &[f32]) -> (Vec<f32>, Vec<Stored>) {
+        let q = vec![1.0, 0.0, 0.0];
+        let photos = gains.iter().map(|&g| Stored::quantize(0, 0, &unit(&[g, (1.0 - g * g).sqrt(), 0.0]))).collect();
+        (q, photos)
+    }
+
     #[test]
     fn ranks_best_first_above_threshold() {
-        let q = unit(&[1.0, 0.0, 0.0]);
-        // Cosines 0.30, 0.10, 0.28, 0.20, 0.24 with the query.
-        let photos: Vec<Stored> = [0.30f32, 0.10, 0.28, 0.20, 0.24]
-            .iter()
-            .map(|&c| Stored::quantize(0, 0, &[c, (1.0 - c * c).sqrt(), 0.0]))
-            .collect();
-        // 0.10 and 0.20 are below MIN_SCORE; 0.24 is more than BELOW_BEST under the best.
+        let (q, photos) = photos_with_gains(&[0.06, 0.01, 0.05, -0.03, 0.015, 0.03]);
+        // 0.01, 0.015 and -0.03 are below MIN_GAIN; 0.03 is within BELOW_BEST of the best.
+        assert_eq!(rank(&q, photos.iter().enumerate()), vec![0, 2, 5]);
+        let (q, photos) = photos_with_gains(&[0.09, 0.03, 0.06]);
+        // 0.03 is more than BELOW_BEST under the best match.
         assert_eq!(rank(&q, photos.iter().enumerate()), vec![0, 2]);
     }
 
     #[test]
-    fn nothing_matches_a_weak_query() {
-        let q = unit(&[1.0, 0.0]);
-        let photos = [Stored::quantize(0, 0, &[0.15, 0.99]), Stored::quantize(0, 0, &[0.0, 1.0])];
+    fn nothing_matches_a_search_for_something_missing() {
+        let (q, photos) = photos_with_gains(&[0.012, -0.01, 0.0, 0.016]);
         assert!(rank(&q, photos.iter().enumerate()).is_empty());
     }
 
@@ -352,14 +367,12 @@ mod tests {
         }
         let queries = std::env::var("BANANA_EVAL_QUERIES").unwrap_or_else(|_| "dog,cat,receipt,man in a suit".into());
         for q in queries.split(',') {
-            let t = text.embed(q).unwrap();
+            let t = text.query(q).unwrap();
             let mut all: Vec<(f32, &str)> = photos.iter().map(|(n, s)| (s.dot(&t), n.as_str())).collect();
             all.sort_by(|a, b| b.0.total_cmp(&a.0));
             let hits = rank(&t, photos.iter().map(|(_, s)| s).enumerate());
-            println!("\n{q:?}: {} results", hits.len());
-            for (s, n) in all.iter().take(hits.len() + 4) {
-                println!("  {s:.3} {n}");
-            }
+            let line: Vec<String> = all.iter().take(hits.len() + 2).map(|(g, n)| format!("{g:+.3} {n}")).collect();
+            println!("{q:>20}: {} | {}", hits.len(), line.join(", "));
         }
     }
 }
