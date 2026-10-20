@@ -5,6 +5,7 @@ mod library;
 mod people;
 mod store;
 mod thumbs;
+mod vault;
 mod video;
 
 use std::path::PathBuf;

@@ -48,6 +48,7 @@ extern "C" {
     static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
     fn CFRelease(cf: CFTypeRef);
     fn CFURLCreateFromFileSystemRepresentation(alloc: CFTypeRef, buf: *const u8, len: CFIndex, is_dir: u8) -> CFTypeRef;
+    fn CFDataCreate(alloc: CFTypeRef, bytes: *const u8, len: CFIndex) -> CFTypeRef;
     fn CFNumberCreate(alloc: CFTypeRef, kind: CFIndex, value: *const c_void) -> CFTypeRef;
     fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, value: *mut c_void) -> u8;
     fn CFDictionaryCreate(
@@ -70,6 +71,7 @@ extern "C" {
     static kCGImagePropertyPixelHeight: CFTypeRef;
     static kCGImagePropertyOrientation: CFTypeRef;
     fn CGImageSourceCreateWithURL(url: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
+    fn CGImageSourceCreateWithData(data: CFTypeRef, options: CFTypeRef) -> CFTypeRef;
     fn CGImageSourceCreateThumbnailAtIndex(src: CFTypeRef, index: usize, options: CFTypeRef) -> CFTypeRef;
     fn CGImageSourceCopyPropertiesAtIndex(src: CFTypeRef, index: usize, options: CFTypeRef) -> CFTypeRef;
 }
@@ -136,7 +138,19 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
 
 /// Decodes the image upright, scaled so its longest side is at most `max_side`.
 pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
-    let src = source(path)?;
+    decode_source(source(path)?, max_side)
+}
+
+/// Same as `decode`, from bytes already in memory (Locked Folder never writes them to disk).
+pub fn decode_data(bytes: &[u8], max_side: u32) -> Option<DynamicImage> {
+    let src = unsafe {
+        let data = Cf::new(CFDataCreate(std::ptr::null(), bytes.as_ptr(), bytes.len() as CFIndex))?;
+        Cf::new(CGImageSourceCreateWithData(data.0, std::ptr::null()))?
+    };
+    decode_source(src, max_side)
+}
+
+fn decode_source(src: Cf, max_side: u32) -> Option<DynamicImage> {
     unsafe {
         let max = max_side as i32;
         let max_num = Cf::new(CFNumberCreate(std::ptr::null(), K_CF_NUMBER_SINT32, &max as *const i32 as *const c_void))?;

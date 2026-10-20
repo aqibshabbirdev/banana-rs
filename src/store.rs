@@ -106,6 +106,20 @@ impl Store {
         self.save();
     }
 
+    /// Drops every reference to a photo that left the library (moved into Locked Folder), so
+    /// its name doesn't linger in albums or favourites in plain text.
+    pub fn forget(&mut self, path: &Path) {
+        self.favorites.remove(path);
+        self.archived.remove(path);
+        for a in &mut self.albums {
+            a.photos.retain(|p| p != path);
+        }
+        let prefix = format!("{}#", path.display());
+        self.face_names.retain(|k, _| !k.starts_with(&prefix));
+        self.hidden_faces.retain(|k| !k.starts_with(&prefix));
+        self.save();
+    }
+
     pub fn create_album(&mut self, name: &str, paths: &[PathBuf]) -> usize {
         self.albums.push(Album { name: self.unique_name(name), photos: Vec::new() });
         let idx = self.albums.len() - 1;

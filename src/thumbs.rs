@@ -145,6 +145,40 @@ pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
     })
 }
 
+/// Decodes an image held in memory (upright, at most `max_side`), for Locked Folder.
+pub fn decode_bytes(bytes: &[u8], name: &Path, max_side: u32) -> Option<DynamicImage> {
+    use image::ImageDecoder;
+    #[cfg(target_os = "macos")]
+    if crate::library::is_heif(name) {
+        return crate::imageio::decode_data(bytes, max_side);
+    }
+    let _ = name;
+    let mut decoder = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+    let orientation = decoder.orientation().ok();
+    let mut img = DynamicImage::from_decoder(decoder).ok()?;
+    if let Some(o) = orientation {
+        img.apply_orientation(o);
+    }
+    Some(if img.width() > max_side || img.height() > max_side {
+        img.resize(max_side, max_side, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    })
+}
+
+/// A small JPEG of a photo or video frame, kept in memory (Locked Folder stores it encrypted).
+pub fn thumbnail_jpeg(path: &Path) -> Option<Vec<u8>> {
+    let img = if crate::video::is_video(path) { crate::video::thumbnail(path, THUMB_SIZE)? } else { decode(path, THUMB_SIZE)? };
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&img.to_rgb8()).ok()?;
+    Some(out)
+}
+
+/// Removes the cached thumbnail of a photo (when it moves into Locked Folder).
+pub fn forget_cached(path: &Path, mtime: u64, size: u64) {
+    let _ = std::fs::remove_file(cache_dir().join(format!("{:016x}.jpg", cache_key(path, mtime, size))));
+}
+
 fn decode_any(path: &Path) -> Option<DynamicImage> {
     use image::ImageDecoder;
     let mut decoder = ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;

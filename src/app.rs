@@ -15,6 +15,7 @@ use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
 use crate::thumbs::{cache_key, spawn_full, Job, Loaded, ThumbLoader};
+use crate::vault;
 use crate::video;
 
 const MAX_TEXTURES: usize = 3000;
@@ -52,6 +53,7 @@ enum Page {
     Pets(Pet),
     Documents,
     Doc(DocKind),
+    Locked,
     Screenshots,
     Recent,
     Archive,
@@ -73,6 +75,7 @@ impl Page {
             Page::Pets(Pet::Dog) => 8,
             Page::Pets(Pet::Cat) => 9,
             Page::Documents => 10,
+            Page::Locked => 16,
             Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
             Page::Person(i) => 101 + 2 * i,
@@ -87,6 +90,39 @@ enum Dialog {
     DeleteAlbum(usize),
     /// Name (or rename) a person; an empty name removes it.
     NamePerson { person: usize, name: String },
+    /// Encrypt these photos into Locked Folder (asks for the passphrase if it's locked).
+    MoveToLocked { paths: Vec<PathBuf>, pass: String, error: Option<String> },
+    /// Vault item ids to delete for good.
+    DeleteLocked(Vec<String>),
+}
+
+#[derive(Default)]
+struct VaultForm {
+    pass: String,
+    pass2: String,
+    error: Option<String>,
+}
+
+struct VaultView {
+    /// Position in `vault_items`.
+    index: usize,
+    texture: Option<TextureHandle>,
+    note: Option<String>,
+}
+
+enum VaultMsg {
+    Moved { path: PathBuf, mtime: u64, size: u64 },
+    Restored,
+    Failed(String),
+    Finished,
+}
+
+struct VaultJob {
+    rx: Receiver<VaultMsg>,
+    verb: &'static str,
+    done: usize,
+    total: usize,
+    errors: Vec<String>,
 }
 
 enum Click {
@@ -206,6 +242,16 @@ pub struct PhotosApp {
     avatars: HashMap<String, Option<TextureHandle>>,
     show_hidden_people: bool,
 
+    // Locked Folder. `vault` holds the data key only while unlocked.
+    vault: Option<vault::Vault>,
+    vault_items: Vec<vault::Item>,
+    vault_thumbs: HashMap<String, TextureHandle>,
+    vault_selected: HashSet<String>,
+    vault_view: Option<VaultView>,
+    vault_form: VaultForm,
+    vault_job: Option<VaultJob>,
+    vault_notice: Option<String>,
+
     scan_rx: Receiver<ScanMsg>,
     scan_tx: Sender<ScanMsg>,
     scan_total: usize,
@@ -276,6 +322,14 @@ impl PhotosApp {
             people_problem: None,
             avatars: HashMap::new(),
             show_hidden_people: false,
+            vault: None,
+            vault_items: Vec::new(),
+            vault_thumbs: HashMap::new(),
+            vault_selected: HashSet::new(),
+            vault_view: None,
+            vault_form: VaultForm::default(),
+            vault_job: None,
+            vault_notice: None,
             scan_rx,
             scan_tx,
             scan_total: 0,
@@ -305,6 +359,9 @@ impl PhotosApp {
         self.gen += 1;
         self.photos.clear();
         self.path_index.clear();
+        // These hold ids into `photos`, which are about to be reused.
+        self.doc_photos.clear();
+        self.photo_tags.clear();
         self.library_bytes = 0;
         self.order.clear();
         self.groups.clear();
@@ -337,6 +394,10 @@ impl PhotosApp {
     }
 
     fn set_page(&mut self, page: Page) {
+        if self.page == Page::Locked && page != Page::Locked && self.vault_job.is_none() {
+            self.lock_vault();
+        }
+        self.vault_notice = None;
         self.page = page;
         self.selected.clear();
         self.anchor = None;
@@ -437,7 +498,7 @@ impl PhotosApp {
                     Page::Videos => !archived && p.is_video,
                     Page::Screenshots => !archived && is_screenshot(&p.path),
                     Page::Archive => archived,
-                    Page::Albums | Page::People => false,
+                    Page::Albums | Page::People | Page::Locked => false,
                     Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                     Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                     Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
@@ -716,6 +777,9 @@ impl PhotosApp {
                     self.view_dirty = true;
                 }
             }
+            if self.vault_job.is_none() && icon_button(ui, icon::LOCK_SIMPLE, 22.0, "Move to Locked Folder").clicked() {
+                self.dialog = Some(Dialog::MoveToLocked { paths: paths.clone(), pass: String::new(), error: None });
+            }
             let archived = paths.iter().all(|p| self.store.is_archived(p));
             if icon_button(ui, icon::ARCHIVE, 22.0, if archived { "Unarchive" } else { "Archive" }).clicked() {
                 self.toggle_archive(&paths);
@@ -806,6 +870,7 @@ impl PhotosApp {
             (icon::DEVICE_MOBILE, "Screenshots & recordings", Page::Screenshots),
             (icon::CLOCK, "Recently added", Page::Recent),
             (icon::ARCHIVE, "Archive", Page::Archive),
+            (icon::LOCK_SIMPLE, "Locked Folder", Page::Locked),
         ];
         for (ic, label, page) in items {
             let on = self.page == page || (page == Page::People && matches!(self.page, Page::Person(_) | Page::Pets(_)));
@@ -859,7 +924,7 @@ impl PhotosApp {
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
         let title = match self.page {
-            Page::Photos | Page::Albums | Page::People => return,
+            Page::Photos | Page::Albums | Page::People | Page::Locked => return,
             Page::Person(i) => {
                 self.person_header(ui, i);
                 return;
@@ -1245,6 +1310,7 @@ impl PhotosApp {
         let mut want_close = close && !typing;
         let mut toggle_fav = fav_key && !typing;
         let mut toggle_archive = false;
+        let mut move_to_locked = false;
         let mut remove = false;
         let title = photo.taken.format("%a, %-d %b %Y · %H:%M").to_string();
         let from_exif = photo.from_exif;
@@ -1272,6 +1338,9 @@ impl PhotosApp {
                     if icon_button(ui, icon::IMAGE_SQUARE, 22.0, "Remove from album").clicked() {
                         remove = true;
                     }
+                }
+                if self.vault_job.is_none() && icon_button(ui, icon::LOCK_SIMPLE, 22.0, "Move to Locked Folder").clicked() {
+                    move_to_locked = true;
                 }
                 if icon_button(ui, icon::ARCHIVE, 22.0, if is_archived { "Unarchive" } else { "Archive" }).clicked() {
                     toggle_archive = true;
@@ -1336,6 +1405,9 @@ impl PhotosApp {
 
         if toggle_fav {
             self.toggle_favorites(std::slice::from_ref(&path));
+        }
+        if move_to_locked {
+            self.dialog = Some(Dialog::MoveToLocked { paths: vec![path.clone()], pass: String::new(), error: None });
         }
         if toggle_archive {
             self.toggle_archive(std::slice::from_ref(&path));
@@ -1762,7 +1834,444 @@ impl PhotosApp {
         }
     }
 
+    fn lock_vault(&mut self) {
+        self.vault = None;
+        self.vault_items.clear();
+        self.vault_thumbs.clear();
+        self.vault_selected.clear();
+        self.vault_view = None;
+        self.vault_form = VaultForm::default();
+    }
+
+    /// Encrypts these photos into Locked Folder, then deletes the originals (background thread).
+    fn start_vault_move(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let Some(vault) = self.vault.clone() else { return };
+        let (tx, rx) = channel();
+        let mut errors = Vec::new();
+        let mut jobs = Vec::new();
+        for path in paths {
+            let in_photos_library =
+                path.ancestors().any(|a| a.extension().is_some_and(|e| e.eq_ignore_ascii_case("photoslibrary")));
+            if in_photos_library {
+                errors.push(format!("{}: inside an Apple Photos library, which only Photos.app may change", path.display()));
+                continue;
+            }
+            let Some(&id) = self.path_index.get(&path) else { continue };
+            let p = &self.photos[id];
+            jobs.push((path, p.taken, p.mtime, p.size, p.is_video, p.aspect));
+        }
+        let total = jobs.len() + errors.len();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for (path, taken, mtime, size, is_video, aspect) in jobs {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let thumb = crate::thumbs::thumbnail_jpeg(&path).unwrap_or_default();
+                let meta = vault::Meta::new(&path, taken, size, is_video, aspect, &thumb);
+                let msg = match vault.add(&path, &meta) {
+                    Ok(_) => match std::fs::remove_file(&path) {
+                        Ok(()) => VaultMsg::Moved { path, mtime, size },
+                        Err(e) => VaultMsg::Failed(format!("{name}: encrypted, but the original couldn't be deleted ({e})")),
+                    },
+                    Err(e) => VaultMsg::Failed(format!("{name}: {e}")),
+                };
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            }
+            let _ = tx.send(VaultMsg::Finished);
+            ctx.request_repaint();
+        });
+        self.vault_job = Some(VaultJob { rx, verb: "Encrypting", done: errors.len(), total, errors });
+    }
+
+    /// Decrypts items back to where they came from (or the open folder) and removes them from the vault.
+    fn start_vault_restore(&mut self, ids: Vec<String>, ctx: &egui::Context) {
+        let Some(vault) = self.vault.clone() else { return };
+        let Some(fallback) = self.root.clone() else { return };
+        let items: Vec<vault::Item> = self.vault_items.iter().filter(|i| ids.contains(&i.id)).cloned().collect();
+        let (tx, rx) = channel();
+        let total = items.len();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            for item in items {
+                let msg = match vault.restore(&item, &fallback) {
+                    Ok(_) => VaultMsg::Restored,
+                    Err(e) => VaultMsg::Failed(format!("{}: {e}", item.meta.name)),
+                };
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            }
+            let _ = tx.send(VaultMsg::Finished);
+            ctx.request_repaint();
+        });
+        self.vault_selected.clear();
+        self.vault_job = Some(VaultJob { rx, verb: "Restoring", done: 0, total, errors: Vec::new() });
+    }
+
+    fn poll_vault(&mut self, ctx: &egui::Context) {
+        let Some(job) = &mut self.vault_job else { return };
+        let mut finished = false;
+        let mut moved = Vec::new();
+        while let Ok(msg) = job.rx.try_recv() {
+            match msg {
+                VaultMsg::Moved { path, mtime, size } => {
+                    job.done += 1;
+                    moved.push((path, mtime, size));
+                }
+                VaultMsg::Restored => job.done += 1,
+                VaultMsg::Failed(e) => {
+                    job.done += 1;
+                    job.errors.push(e);
+                }
+                VaultMsg::Finished => finished = true,
+            }
+        }
+        // Wipe the plain-text traces a locked photo leaves behind: cached thumbnail, face
+        // crops, analysis entry, and its name in albums and favourites.
+        for (path, mtime, size) in moved {
+            crate::thumbs::forget_cached(&path, mtime, size);
+            if let Some(a) = self.people_index.entries.remove(&path) {
+                for i in 0..a.faces.len() {
+                    if let Some(crop) = people::crop_path(&path, a.mtime, a.size, i) {
+                        let _ = std::fs::remove_file(crop);
+                    }
+                }
+                self.people_index_dirty = true;
+            }
+            self.store.forget(&path);
+        }
+        if finished {
+            let job = self.vault_job.take().unwrap();
+            let ok = job.total - job.errors.len();
+            let mut notice = match job.verb {
+                "Encrypting" => format!("{ok} item{} moved into Locked Folder.", if ok == 1 { "" } else { "s" }),
+                _ => format!("{ok} item{} moved back to your folder.", if ok == 1 { "" } else { "s" }),
+            };
+            if !job.errors.is_empty() {
+                notice += &format!(" {} failed: {}", job.errors.len(), job.errors.join("; "));
+            }
+            self.vault_notice = Some(notice);
+            if let Some(v) = &self.vault {
+                self.vault_items = v.items();
+                self.vault_thumbs.retain(|id, _| self.vault_items.iter().any(|i| &i.id == id));
+            }
+            if self.page != Page::Locked {
+                self.lock_vault();
+            }
+            // Re-scan so moved photos leave (or come back to) the library.
+            if let Some(root) = self.root.clone() {
+                self.people_index.save();
+                self.open_folder(root, ctx);
+            }
+        }
+    }
+
+    /// Set-up or unlock screen.
+    fn vault_gate(&mut self, ui: &mut egui::Ui) {
+        let exists = vault::exists();
+        let mut submit = false;
+        ui.vertical_centered(|ui| {
+            ui.add_space(70.0);
+            ui.label(egui::RichText::new(icon::LOCK_SIMPLE).size(64.0).color(ACCENT));
+            ui.add_space(10.0);
+            let title = if exists { "Locked Folder is locked" } else { "Set up Locked Folder" };
+            ui.label(egui::RichText::new(title).size(26.0).color(TEXT));
+            ui.add_space(6.0);
+            let text = if exists {
+                "Enter your passphrase to see the photos inside."
+            } else {
+                "Photos you move here are encrypted on this computer and removed from your folders. They don't show up in Photos, search, albums or other apps."
+            };
+            ui.add(egui::Label::new(egui::RichText::new(text).color(TEXT_DIM)).wrap());
+            ui.add_space(18.0);
+
+            ui.allocate_ui(vec2(380.0, 0.0), |ui| {
+                let field = |ui: &mut egui::Ui, value: &mut String, hint: &str, focus: bool| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(value)
+                            .password(true)
+                            .hint_text(hint)
+                            .font(FontId::proportional(16.0))
+                            .desired_width(380.0),
+                    );
+                    if focus && !r.has_focus() && ui.memory(|m| m.focused().is_none()) {
+                        r.request_focus();
+                    }
+                    r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+                };
+                if exists {
+                    submit |= field(ui, &mut self.vault_form.pass, "Passphrase", true);
+                } else {
+                    submit |= field(ui, &mut self.vault_form.pass, "Choose a passphrase", true);
+                    ui.add_space(6.0);
+                    submit |= field(ui, &mut self.vault_form.pass2, "Type it again", false);
+                    let s = vault::strength(&self.vault_form.pass);
+                    if !s.is_empty() {
+                        ui.label(egui::RichText::new(format!("Strength: {s}")).color(TEXT_DIM));
+                    }
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{}  There is no way to recover it. If you forget the passphrase, the photos in Locked Folder are lost for good. Four or more random words make a strong one.",
+                                icon::WARNING
+                            ))
+                            .color(HEART),
+                        )
+                        .wrap(),
+                    );
+                }
+                if let Some(e) = &self.vault_form.error {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(e).color(HEART));
+                }
+                ui.add_space(14.0);
+                let label = if exists { "Unlock" } else { "Create Locked Folder" };
+                let b = egui::Button::new(egui::RichText::new(label).color(Color32::from_rgb(6, 46, 111)))
+                    .fill(ACCENT)
+                    .corner_radius(CornerRadius::same(18))
+                    .min_size(vec2(380.0, 40.0));
+                if ui.add(b).clicked() {
+                    submit = true;
+                }
+            });
+        });
+
+        if !submit {
+            return;
+        }
+        let result = if exists {
+            vault::Vault::unlock(&self.vault_form.pass)
+        } else if self.vault_form.pass != self.vault_form.pass2 {
+            self.vault_form.error = Some("The two passphrases don't match.".into());
+            return;
+        } else {
+            vault::Vault::create(&self.vault_form.pass)
+        };
+        match result {
+            Ok(v) => {
+                self.vault_items = v.items();
+                self.vault = Some(v);
+                self.vault_form = VaultForm::default();
+            }
+            Err(e) => {
+                self.vault_form.error = Some(e.to_string());
+                self.vault_form.pass.clear();
+                self.vault_form.pass2.clear();
+            }
+        }
+    }
+
+    fn locked_page(&mut self, ui: &mut egui::Ui) {
+        if self.vault.is_none() {
+            self.vault_gate(ui);
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let mut lock = false;
+        let mut restore = false;
+        let mut delete = false;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Locked Folder").size(30.0).color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let b = egui::Button::new(egui::RichText::new(format!("{}  Lock", icon::LOCK_SIMPLE)).color(ACCENT))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0_f32, Color32::from_gray(110)))
+                    .corner_radius(CornerRadius::same(18))
+                    .min_size(vec2(96.0, 36.0));
+                if ui.add(b).clicked() {
+                    lock = true;
+                }
+                if !self.vault_selected.is_empty() && self.vault_job.is_none() {
+                    if icon_button(ui, icon::TRASH, 22.0, "Delete for good").clicked() {
+                        delete = true;
+                    }
+                    if icon_button(ui, icon::ARROW_SQUARE_OUT, 22.0, "Move out of Locked Folder").clicked() {
+                        restore = true;
+                    }
+                    ui.label(egui::RichText::new(format!("{} selected", self.vault_selected.len())).color(TEXT));
+                }
+            });
+        });
+        let n = self.vault_items.len();
+        ui.label(
+            egui::RichText::new(format!(
+                "{n} item{} · {} encrypted with XChaCha20-Poly1305, key from your passphrase (Argon2id)",
+                if n == 1 { "" } else { "s" },
+                icon::SHIELD_CHECK
+            ))
+            .color(TEXT_DIM),
+        );
+        if let Some(job) = &self.vault_job {
+            ui.add(egui::ProgressBar::new(job.done as f32 / job.total.max(1) as f32).desired_width(360.0).text(format!("{} {} of {}", job.verb, job.done, job.total)));
+        }
+        if let Some(notice) = &self.vault_notice {
+            ui.label(egui::RichText::new(notice).color(ACCENT));
+        }
+        ui.add_space(12.0);
+
+        if self.vault_items.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(egui::RichText::new(icon::LOCK_SIMPLE).size(56.0).color(TEXT_DIM));
+                ui.label(egui::RichText::new("Nothing here yet").size(22.0).color(TEXT));
+                ui.label(
+                    egui::RichText::new("Select photos in Photos, then choose the lock button to move them here.").color(TEXT_DIM),
+                );
+            });
+        } else {
+            let mods = ui.input(|i| i.modifiers);
+            let selecting = !self.vault_selected.is_empty();
+            let mut budget = 30usize;
+            let mut click: Option<(usize, bool)> = None;
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+                    let cell = self.row_height.clamp(120.0, 260.0);
+                    for (i, item) in self.vault_items.iter().enumerate() {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(cell, cell), Sense::click());
+                        if !ui.is_rect_visible(rect) {
+                            continue;
+                        }
+                        if !self.vault_thumbs.contains_key(&item.id) && budget > 0 {
+                            budget -= 1;
+                            let jpeg = item.meta.thumb_jpeg();
+                            if let Ok(img) = image::load_from_memory(&jpeg) {
+                                let rgba = img.to_rgba8();
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let tex = ctx.load_texture(format!("vault {}", item.id), egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), TextureOptions::LINEAR);
+                                self.vault_thumbs.insert(item.id.clone(), tex);
+                            }
+                        }
+                        let selected = self.vault_selected.contains(&item.id);
+                        let badge = item.meta.is_video.then(String::new);
+                        draw_cell(ui, rect, self.vault_thumbs.get(&item.id), false, selected, false, resp.hovered() || selecting, badge);
+                        if resp.clicked() {
+                            let check = Rect::from_center_size(rect.min + vec2(18.0, 18.0), vec2(30.0, 30.0));
+                            let on_check = resp.interact_pointer_pos().is_some_and(|p| check.contains(p));
+                            click = Some((i, selecting || mods.command || on_check));
+                        }
+                    }
+                });
+            });
+            match click {
+                Some((i, true)) => {
+                    let id = self.vault_items[i].id.clone();
+                    if !self.vault_selected.remove(&id) {
+                        self.vault_selected.insert(id);
+                    }
+                }
+                Some((i, false)) => self.open_vault_item(i, &ctx),
+                None => {}
+            }
+        }
+
+        if lock {
+            self.lock_vault();
+        } else if restore {
+            let ids: Vec<String> = self.vault_selected.iter().cloned().collect();
+            self.start_vault_restore(ids, &ctx);
+        } else if delete {
+            self.dialog = Some(Dialog::DeleteLocked(self.vault_selected.iter().cloned().collect()));
+        }
+    }
+
+    /// Decrypts one item in memory for the full-screen view (videos show their thumbnail).
+    fn open_vault_item(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(item) = self.vault_items.get(index) else { return };
+        let mut view = VaultView { index, texture: None, note: None };
+        if item.meta.is_video {
+            view.note = Some("Move this video out of Locked Folder to play it.".into());
+        } else if let Some(v) = &self.vault {
+            match v.read(&item.id) {
+                Ok(bytes) => match crate::thumbs::decode_bytes(&bytes, &item.meta.original, 4096) {
+                    Some(img) => {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        view.texture = Some(ctx.load_texture("vault full", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), TextureOptions::LINEAR));
+                    }
+                    None => view.note = Some("Couldn't open this image.".into()),
+                },
+                Err(e) => view.note = Some(e.to_string()),
+            }
+        }
+        self.vault_view = Some(view);
+    }
+
+    fn vault_viewer(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Some(view) = &self.vault_view else { return };
+        let index = view.index;
+        let Some(item) = self.vault_items.get(index).cloned() else {
+            self.vault_view = None;
+            return;
+        };
+        let (close, prev, next) = ctx.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
+        let mut go = None;
+        let mut want_close = close;
+        let mut restore = false;
+        let mut delete = false;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            if icon_button(ui, icon::ARROW_LEFT, 24.0, "Back (Esc)").clicked() {
+                want_close = true;
+            }
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(item.meta.taken.format("%a, %-d %b %Y · %H:%M").to_string()).size(15.0).color(TEXT));
+                ui.label(egui::RichText::new(format!("{}  {}  Locked", item.meta.name, icon::LOCK_SIMPLE)).size(12.0).color(TEXT_DIM));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new(format!("{} / {}", index + 1, self.vault_items.len())).color(TEXT_DIM));
+                if self.vault_job.is_none() {
+                    if icon_button(ui, icon::TRASH, 22.0, "Delete for good").clicked() {
+                        delete = true;
+                    }
+                    if icon_button(ui, icon::ARROW_SQUARE_OUT, 22.0, "Move out of Locked Folder").clicked() {
+                        restore = true;
+                    }
+                }
+            });
+        });
+        ui.add_space(6.0);
+        if prev && index > 0 {
+            go = Some(index - 1);
+        }
+        if next && index + 1 < self.vault_items.len() {
+            go = Some(index + 1);
+        }
+
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, Color32::BLACK);
+        let view = self.vault_view.as_ref().unwrap();
+        let tex = view.texture.as_ref().or_else(|| self.vault_thumbs.get(&item.id));
+        if let Some(t) = tex {
+            let size = t.size_vec2();
+            let scale = (area.width() / size.x).min(area.height() / size.y).min(if view.texture.is_some() { 1.0 } else { f32::MAX });
+            ui.painter().image(t.id(), Rect::from_center_size(area.center(), size * scale), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        if let Some(note) = &view.note {
+            let c = area.center();
+            ui.painter().rect_filled(Rect::from_center_size(c, vec2(440.0, 56.0)), CornerRadius::same(14), Color32::from_black_alpha(190));
+            ui.painter().text(c, Align2::CENTER_CENTER, note, FontId::proportional(15.0), Color32::WHITE);
+        }
+
+        if want_close {
+            self.vault_view = None;
+        } else if restore {
+            self.vault_view = None;
+            self.start_vault_restore(vec![item.id.clone()], &ctx);
+        } else if delete {
+            self.dialog = Some(Dialog::DeleteLocked(vec![item.id.clone()]));
+        } else if let Some(i) = go {
+            self.open_vault_item(i, &ctx);
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
+        let vault_exists = vault::exists();
+        let vault_open = self.vault.is_some();
         let Some(dialog) = &mut self.dialog else { return };
         let mut confirm = false;
         let mut cancel = false;
@@ -1794,6 +2303,55 @@ impl PhotosApp {
                     ui.add_space(8.0);
                     confirm |= name_field(ui, name);
                     "Rename"
+                }
+                Dialog::MoveToLocked { paths, pass, error } => {
+                    ui.label(egui::RichText::new(format!("{}  Move to Locked Folder?", icon::LOCK_SIMPLE)).size(20.0).color(TEXT));
+                    ui.add_space(4.0);
+                    if !vault_exists {
+                        ui.add(egui::Label::new(egui::RichText::new("Set up Locked Folder first by choosing a passphrase, then come back.").color(TEXT_DIM)).wrap());
+                        "Set up"
+                    } else {
+                        let n = paths.len();
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{n} item{} will be encrypted and removed from this folder. They'll only show up in Locked Folder.",
+                                    if n == 1 { "" } else { "s" }
+                                ))
+                                .color(TEXT_DIM),
+                            )
+                            .wrap(),
+                        );
+                        if !vault_open {
+                            ui.add_space(8.0);
+                            let r = ui.add(
+                                egui::TextEdit::singleline(pass)
+                                    .password(true)
+                                    .hint_text("Locked Folder passphrase")
+                                    .font(FontId::proportional(16.0))
+                                    .desired_width(f32::INFINITY),
+                            );
+                            r.request_focus();
+                            confirm |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        }
+                        if let Some(e) = error {
+                            ui.label(egui::RichText::new(e.as_str()).color(HEART));
+                        }
+                        "Move"
+                    }
+                }
+                Dialog::DeleteLocked(ids) => {
+                    ui.label(egui::RichText::new("Delete for good?").size(20.0).color(TEXT));
+                    ui.add_space(4.0);
+                    let n = ids.len();
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{n} item{} will be deleted from Locked Folder. This can't be undone.", if n == 1 { "" } else { "s" }))
+                                .color(TEXT_DIM),
+                        )
+                        .wrap(),
+                    );
+                    "Delete"
                 }
                 Dialog::NamePerson { name, .. } => {
                     ui.label(egui::RichText::new("Who is this?").size(20.0).color(TEXT));
@@ -1848,6 +2406,34 @@ impl PhotosApp {
                     self.store.delete_album(i);
                     self.set_page(Page::Albums);
                 }
+                Some(Dialog::MoveToLocked { paths, pass, .. }) => {
+                    if !vault::exists() {
+                        self.set_page(Page::Locked);
+                    } else {
+                        if self.vault.is_none() {
+                            match vault::Vault::unlock(&pass) {
+                                Ok(v) => self.vault = Some(v),
+                                Err(e) => {
+                                    self.dialog = Some(Dialog::MoveToLocked { paths, pass: String::new(), error: Some(e.to_string()) });
+                                    return;
+                                }
+                            }
+                        }
+                        self.selected.clear();
+                        self.viewer = None;
+                        self.start_vault_move(paths, ctx);
+                    }
+                }
+                Some(Dialog::DeleteLocked(ids)) => {
+                    if let Some(v) = &self.vault {
+                        for id in &ids {
+                            let _ = v.delete(id);
+                        }
+                        self.vault_items.retain(|i| !ids.contains(&i.id));
+                        self.vault_selected.clear();
+                        self.vault_view = None;
+                    }
+                }
                 Some(Dialog::NamePerson { person, name }) => {
                     if let Some(p) = self.people.get(person) {
                         let keys = p.keys();
@@ -1894,7 +2480,17 @@ impl eframe::App for PhotosApp {
         #[cfg(debug_assertions)]
         self.debug_hooks(ctx);
 
-        if self.viewer.is_some() {
+        self.poll_vault(ctx);
+        // Minimising the window locks Locked Folder, like leaving the page does.
+        if self.vault.is_some() && self.vault_job.is_none() && ctx.input(|i| i.viewport().minimized == Some(true)) {
+            self.lock_vault();
+        }
+
+        if self.page == Page::Locked && self.vault_view.is_some() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Color32::BLACK))
+                .show(ctx, |ui| self.vault_viewer(ui));
+        } else if self.viewer.is_some() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Color32::BLACK))
                 .show(ctx, |ui| self.viewer(ui));
@@ -1929,6 +2525,8 @@ impl eframe::App for PhotosApp {
                         self.albums_page(ui);
                     } else if self.page == Page::People {
                         self.people_page(ui);
+                    } else if self.page == Page::Locked {
+                        self.locked_page(ui);
                     } else {
                         self.grid(ui);
                     }
@@ -2167,7 +2765,8 @@ fn save_last_folder(dir: &std::path::Path) {
 /// Dev-only hooks for screenshots without touching the mouse:
 /// `BANANA_SCREENSHOT=out.png` saves the window once the scan settles, then quits.
 /// `BANANA_PAGE=favorites|albums|album<N>|archive|recent|screenshots`, `BANANA_SELECT=0,1,2`,
-/// `BANANA_SEARCH=text` and `BANANA_OPEN=<n>` set the scene first.
+/// `BANANA_SEARCH=text` and `BANANA_OPEN=<n>` set the scene first. `BANANA_VAULT_PASS` opens
+/// (or creates) Locked Folder, and `BANANA_VAULT_MOVE=0,1` moves those photos into it.
 #[cfg(debug_assertions)]
 impl PhotosApp {
     fn debug_hooks(&mut self, ctx: &egui::Context) {
@@ -2182,6 +2781,7 @@ impl PhotosApp {
                 Some("videos") => self.set_page(Page::Videos),
                 Some("people") => self.set_page(Page::People),
                 Some("documents") => self.set_page(Page::Documents),
+                Some("locked") => self.set_page(Page::Locked),
                 Some("receipts") => self.set_page(Page::Doc(DocKind::Receipt)),
                 Some("dogs") => self.set_page(Page::Pets(Pet::Dog)),
                 Some("cats") => self.set_page(Page::Pets(Pet::Cat)),
@@ -2207,6 +2807,21 @@ impl PhotosApp {
             }
             if let Some(n) = var("BANANA_OPEN").and_then(|s| s.parse().ok()) {
                 self.open_viewer(n, ctx);
+            }
+            if let Some(pass) = var("BANANA_VAULT_PASS") {
+                let opened = if vault::exists() { vault::Vault::unlock(&pass) } else { vault::Vault::create(&pass) };
+                if let Ok(v) = opened {
+                    self.vault_items = v.items();
+                    self.vault = Some(v);
+                }
+                if let Some(list) = var("BANANA_VAULT_MOVE") {
+                    let paths: Vec<PathBuf> = list
+                        .split(',')
+                        .filter_map(|s| s.parse::<usize>().ok())
+                        .filter_map(|pos| self.order.get(pos).map(|&id| self.photos[id].path.clone()))
+                        .collect();
+                    self.start_vault_move(paths, ctx);
+                }
             }
         }
         if self.debug_done && t > self.debug_done_at + 2.5 && !self.debug_shot_sent {
