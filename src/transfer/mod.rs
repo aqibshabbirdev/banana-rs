@@ -385,7 +385,7 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
                         if let Some((title, t)) = std::fs::read(e.path()).ok().and_then(|b| sidecar_date(&b)) {
                             dates.insert(split(&rel).0, title, t);
                         }
-                    } else if is_media(e.path()) {
+                    } else if is_media(e.path()) && e.metadata().is_ok_and(|m| m.len() > 0) {
                         let meta = e.metadata().ok();
                         let mtime = meta.as_ref().and_then(|m| m.modified().ok()).map(|t| DateTime::<Local>::from(t).naive_local());
                         media.push((si, rel, meta.map(|m| m.len()).unwrap_or(0), mtime));
@@ -410,7 +410,7 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
                                 dates.insert(split(&name).0, title, t);
                             }
                         }
-                    } else if is_media(Path::new(&name)) {
+                    } else if is_media(Path::new(&name)) && entry.size() > 0 {
                         let mtime = entry.last_modified().and_then(|d| {
                             NaiveDate::from_ymd_opt(d.year() as i32, d.month() as u32, d.day() as u32)?
                                 .and_hms_opt(d.hour() as u32, d.minute() as u32, d.second() as u32)

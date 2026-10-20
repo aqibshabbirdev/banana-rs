@@ -98,7 +98,9 @@ struct Cf(CFTypeRef);
 
 impl Cf {
     fn new(ptr: CFTypeRef) -> Option<Self> {
-        (!ptr.is_null()).then_some(Self(ptr))
+        // `then`, not `then_some`: the latter builds `Self(ptr)` first, and dropping that
+        // unused value would CFRelease(NULL) and abort (crashed on 0-byte HEIC files).
+        (!ptr.is_null()).then(|| Self(ptr))
     }
 }
 
@@ -196,5 +198,28 @@ pub fn cgimage_to_image(img: *const c_void) -> Option<DynamicImage> {
         drop(ctx);
 
         RgbaImage::from_raw(w as u32, h as u32, pixels).map(DynamicImage::ImageRgba8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Empty or broken files make ImageIO return NULL; that must be `None`, not a crash.
+    #[test]
+    fn unreadable_files_are_none() {
+        let dir = std::env::temp_dir().join(format!("banana-imageio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.heic");
+        std::fs::write(&empty, b"").unwrap();
+        let junk = dir.join("junk.dng");
+        std::fs::write(&junk, b"not an image at all").unwrap();
+        for p in [&empty, &junk, &dir.join("missing.heic")] {
+            assert!(dimensions(p).is_none(), "{}", p.display());
+            assert!(decode(p, 320).is_none(), "{}", p.display());
+        }
+        assert!(decode_data(b"", 320).is_none());
+        assert!(decode_data(b"junk", 320).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

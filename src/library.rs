@@ -76,6 +76,10 @@ pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egu
 
 pub fn read_photo(path: &Path) -> Option<Photo> {
     let meta = std::fs::metadata(path).ok()?;
+    // Empty files (interrupted downloads, iCloud placeholders) have nothing to show.
+    if meta.len() == 0 {
+        return None;
+    }
     let modified = meta.modified().ok()?;
     let mtime = modified.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let added = DateTime::<Local>::from(modified).naive_local();
