@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Downloads the ONNX models People & pets and Documents use into assets/models (or $1),
-# and checks their SHA-256. All four are free for commercial use:
+# Downloads the ONNX models People & pets, Documents and search use into assets/models (or $1),
+# and checks their SHA-256. All are free for commercial use:
 #   YuNet face detector   - OpenCV Zoo, MIT
 #   SFace face recognizer - OpenCV Zoo, Apache-2.0
 #   MobileNetV2 (ImageNet)- ONNX Model Zoo, Apache-2.0
-#   CLIP ViT-B/32 image encoder (OpenAI, MIT; int8 export by Xenova) - for Documents
+#   CLIP ViT-B/32 image encoder (OpenAI, MIT; int8 export by Xenova) - for Documents and search
+#   CLIP ViT-B/32 text encoder + tokenizer (same source)               - for search by description
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DEST="${1:-assets/models}"
@@ -42,5 +43,12 @@ fetch mobilenetv2-12.onnx \
 fetch clip_vision_quantized.onnx \
   https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx \
   583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299
+
+fetch clip_text_quantized.onnx \
+  https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/text_model_quantized.onnx \
+  73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a
+fetch clip_tokenizer.json \
+  https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/tokenizer.json \
+  f7f3b7af117d467b58374797691a6438d3e6b9e9cef800dfd5dced7f697a90cd
 
 echo "Models are in $DEST"

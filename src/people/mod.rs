@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub use vision::{CLASSIFIER, DETECTOR, RECOGNIZER};
+pub use vision::{CLASSIFIER, CLIP, DETECTOR, RECOGNIZER};
 
 // Grouping settings, tuned on a real 3,500-photo family library (4,087 faces): the old
 // "join the nearest group average" approach put ~900 photos of different people in one group,
@@ -93,10 +93,14 @@ pub struct Analysis {
     /// Bumped when analysis gains a new kind of result, so older entries are redone.
     #[serde(default)]
     pub version: u32,
+    /// CLIP embedding for search. Not saved in people.json: the app moves it into the compact
+    /// clip.bin (see crate::clip::Embeddings).
+    #[serde(skip)]
+    pub clip: Option<Vec<f32>>,
 }
 
-/// 2 added Documents.
-pub const ANALYSIS_VERSION: u32 = 2;
+/// 2 added Documents, 3 CLIP embeddings for search.
+pub const ANALYSIS_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Index {
@@ -226,6 +230,7 @@ pub fn spawn(jobs: Vec<Job>, gen: u64, current: Arc<AtomicU64>, models: PathBuf,
                     pet: None,
                     doc: None,
                     version: ANALYSIS_VERSION,
+                    clip: None,
                 });
                 let _ = tx.send(Msg::Analysed { gen, path: job.path.clone(), analysis });
                 ctx.request_repaint();
@@ -248,8 +253,9 @@ fn analyse(models: &vision::Models, job: &Job) -> Option<Analysis> {
         save_crop(&img, &det, crop_path(&job.path, job.mtime, job.size, faces.len()));
         faces.push(Face { bbox: [det.x / iw, det.y / ih, det.w / iw, det.h / ih], score: det.score, embedding });
     }
-    let doc = models.document(&img).ok().flatten();
-    Some(Analysis { mtime: job.mtime, size: job.size, faces, pet, doc, version: ANALYSIS_VERSION })
+    let clip = models.clip(&img).ok().flatten();
+    let doc = clip.as_deref().and_then(vision::Models::document);
+    Some(Analysis { mtime: job.mtime, size: job.size, faces, pet, doc, version: ANALYSIS_VERSION, clip })
 }
 
 /// Square crop around the face with some margin, for the round avatar.

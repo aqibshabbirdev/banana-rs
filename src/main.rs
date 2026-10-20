@@ -1,4 +1,5 @@
 mod app;
+mod clip;
 #[cfg(target_os = "macos")]
 mod imageio;
 mod library;

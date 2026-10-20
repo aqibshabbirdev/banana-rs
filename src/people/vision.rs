@@ -193,9 +193,8 @@ impl Models {
 }
 
 impl Models {
-    /// Which kind of document the photo is, if any: CLIP compares the picture with each prompt,
-    /// and a category wins when its prompts take over half of the softmax.
-    pub fn document(&self, img: &RgbImage) -> TractResult<Option<DocKind>> {
+    /// CLIP's unit-length embedding of the photo (centre crop), or None without the model.
+    pub fn clip(&self, img: &RgbImage) -> TractResult<Option<Vec<f32>>> {
         let Some(clip) = &self.clip else { return Ok(None) };
         let r = center_crop(img, 224.0, FilterType::CatmullRom);
         const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
@@ -204,12 +203,17 @@ impl Models {
             (r.get_pixel(x as u32, y as u32)[c] as f32 / 255.0 - MEAN[c]) / STD[c]
         });
         let out = clip.run(tvec!(Tensor::from(input).into()))?;
-        let emb = out[0].try_as_plain_ram()?.as_slice::<f32>()?;
-        let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        let mut emb = out[0].try_as_plain_ram()?.as_slice::<f32>()?.to_vec();
+        crate::clip::normalize(&mut emb);
+        Ok(Some(emb))
+    }
 
+    /// Which kind of document a photo with this CLIP embedding is, if any: the picture is
+    /// compared with each prompt, and a category wins when its prompts take over half of the softmax.
+    pub fn document(emb: &[f32]) -> Option<DocKind> {
         let prompts = doc_prompts();
         // CLIP's learned temperature is 100.
-        let logits: Vec<f32> = prompts.iter().map(|(_, p)| 100.0 * p.iter().zip(emb).map(|(a, b)| a * b).sum::<f32>() / norm).collect();
+        let logits: Vec<f32> = prompts.iter().map(|(_, p)| 100.0 * p.iter().zip(emb).map(|(a, b)| a * b).sum::<f32>()).collect();
         let max = logits.iter().cloned().fold(f32::MIN, f32::max);
         let exp: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
         let total: f32 = exp.iter().sum();
@@ -220,7 +224,7 @@ impl Models {
                 best = (Some(kind), p);
             }
         }
-        Ok(if best.1 >= 0.5 { best.0 } else { None })
+        if best.1 >= 0.5 { best.0 } else { None }
     }
 }
 
