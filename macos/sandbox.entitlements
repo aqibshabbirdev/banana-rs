@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- App Sandbox permissions for the Mac App Store build (scripts/build-macos.sh with APPSTORE=1). -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.app-sandbox</key><true/>
+  <!-- Library folders, import sources and export destinations the user picks. -->
+  <key>com.apple.security.files.user-selected.read-write</key><true/>
+  <!-- Reopen the last library at launch (security-scoped bookmarks, src/access.rs). -->
+  <key>com.apple.security.files.bookmarks.app-scope</key><true/>
+  <!-- The Pictures folder is the default library. -->
+  <key>com.apple.security.assets.pictures.read-write</key><true/>
+  <!-- Import from the Photos app (PhotoKit). -->
+  <key>com.apple.security.personal-information.photos-library</key><true/>
+  <!-- Google Photos import: HTTPS to Google, and a 127.0.0.1 listener for the sign-in redirect. -->
+  <key>com.apple.security.network.client</key><true/>
+  <key>com.apple.security.network.server</key><true/>
+</dict>
+</plist>

@@ -1,3 +1,4 @@
+mod access;
 mod app;
 mod clip;
 #[cfg(target_os = "macos")]

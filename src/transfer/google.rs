@@ -107,7 +107,7 @@ fn random_token(len: usize) -> String {
 
 fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
+    crate::access::open_url(url);
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

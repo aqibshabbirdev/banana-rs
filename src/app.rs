@@ -481,6 +481,7 @@ impl PhotosApp {
             #[cfg(debug_assertions)]
             debug_done_at: 0.0,
         };
+        crate::access::restore();
         if let Some(dir) = start.or_else(load_last_folder).or_else(dirs::picture_dir) {
             app.open_folder(dir, &cc.egui_ctx);
         }
@@ -523,6 +524,8 @@ impl PhotosApp {
             dialog = dialog.set_directory(root);
         }
         if let Some(dir) = dialog.pick_folder() {
+            // In the App Store (sandboxed) build, this is what lets the next launch reopen it.
+            crate::access::remember(&dir);
             self.open_folder(dir, ctx);
         }
     }

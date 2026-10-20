@@ -52,7 +52,7 @@ pub fn format_duration(secs: f64) -> String {
 /// Hands the file to the system's default app (QuickTime, VLC, …).
 pub fn open_externally(path: &Path) {
     #[cfg(target_os = "macos")]
-    let cmd = std::process::Command::new("open").arg(path).spawn();
+    let cmd = crate::access::open_file(path);
     #[cfg(target_os = "windows")]
     let cmd = std::process::Command::new("explorer").arg(path).spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
