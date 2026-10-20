@@ -120,7 +120,7 @@ pub fn spawn_import(dest: PathBuf, filter: Filter, favorites_only: bool, cancel:
             if cancel.cancelled() {
                 break;
             }
-            let result: Result<bool, String> = autoreleasepool(|_| {
+            let result: Result<Option<PathBuf>, String> = autoreleasepool(|_| {
                 std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
                 let tmp = dest.join(format!(".banana-photos-{i}-{}", std::process::id()));
                 let _ = std::fs::remove_file(&tmp);
@@ -143,8 +143,11 @@ pub fn spawn_import(dest: PathBuf, filter: Filter, favorites_only: bool, cancel:
                 }
             });
             match result {
-                Ok(true) => copied += 1,
-                Ok(false) => skipped += 1,
+                Ok(Some(p)) => {
+                copied += 1;
+                r.send(Msg::Imported(p));
+            }
+                Ok(None) => skipped += 1,
                 Err(e) => {
                     failed += 1;
                     r.send(Msg::Failed(format!("{}: {e}", pick.name)));

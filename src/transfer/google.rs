@@ -328,8 +328,11 @@ fn run(cfg: &ClientConfig, dest: &Path, filter: &Filter, cancel: &Cancel, r: &Re
             save_file(dest, name, *taken, &tmp).map_err(|e| e.to_string())
         })();
         match result {
-            Ok(true) => copied += 1,
-            Ok(false) => skipped += 1,
+            Ok(Some(p)) => {
+                copied += 1;
+                r.send(Msg::Imported(p));
+            }
+            Ok(None) => skipped += 1,
             Err(e) => {
                 failed += 1;
                 r.send(Msg::Failed(format!("{name}: {e}")));

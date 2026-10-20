@@ -28,6 +28,10 @@ pub struct Store {
     /// Faces of people the user hid from People & pets.
     #[serde(default)]
     pub hidden_faces: HashSet<String>,
+    /// Folders of imports kept apart: their photos stay out of the Photos timeline and show
+    /// in their own album.
+    #[serde(default)]
+    pub separate: HashSet<PathBuf>,
 }
 
 impl Store {
@@ -117,6 +121,19 @@ impl Store {
         let prefix = format!("{}#", path.display());
         self.face_names.retain(|k, _| !k.starts_with(&prefix));
         self.hidden_faces.retain(|k| !k.starts_with(&prefix));
+        self.save();
+    }
+
+    pub fn is_separate(&self, path: &Path) -> bool {
+        self.separate.iter().any(|f| path.starts_with(f))
+    }
+
+    pub fn set_separate(&mut self, folder: &Path, separate: bool) {
+        if separate {
+            self.separate.insert(folder.to_path_buf());
+        } else {
+            self.separate.retain(|f| f != folder);
+        }
         self.save();
     }
 

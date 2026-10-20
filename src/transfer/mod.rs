@@ -100,6 +100,8 @@ pub enum Msg {
     Progress { done: usize, total: usize },
     /// A file that couldn't be copied, and why.
     Failed(String),
+    /// A file an import just added to the library.
+    Imported(PathBuf),
     /// Finished; the summary to show.
     Done(String),
 }
@@ -254,14 +256,17 @@ pub fn spawn_folder_import(src: PathBuf, dest: PathBuf, filter: Filter, cancel: 
             }
             let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let result = (|| {
-                let Some(out) = target(&dest, &name, *taken, *size, true)? else { return Ok(false) };
+                let Some(out) = target(&dest, &name, *taken, *size, true)? else { return Ok(None) };
                 std::fs::copy(p, &out)?;
                 set_mtime(&out, *taken);
-                Ok::<bool, std::io::Error>(true)
+                Ok::<Option<PathBuf>, std::io::Error>(Some(out))
             })();
             match result {
-                Ok(true) => copied += 1,
-                Ok(false) => skipped += 1,
+                Ok(Some(p)) => {
+                    copied += 1;
+                    r.send(Msg::Imported(p));
+                }
+                Ok(None) => skipped += 1,
                 Err(e) => {
                     failed += 1;
                     r.send(Msg::Failed(format!("{name}: {e}")));
@@ -444,7 +449,7 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
             }
             let (_, name) = split(&rel);
             let result = (|| {
-                let Some(out) = target(&dest, &name, taken, size, true)? else { return Ok(false) };
+                let Some(out) = target(&dest, &name, taken, size, true)? else { return Ok(None) };
                 let src = &sources[si];
                 if src.is_dir() {
                     std::fs::copy(src.join(&rel), &out)?;
@@ -462,11 +467,14 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
                     std::fs::rename(&tmp, &out)?;
                 }
                 set_mtime(&out, taken);
-                Ok::<bool, std::io::Error>(true)
+                Ok::<Option<PathBuf>, std::io::Error>(Some(out))
             })();
             match result {
-                Ok(true) => copied += 1,
-                Ok(false) => skipped += 1,
+                Ok(Some(p)) => {
+                    copied += 1;
+                    r.send(Msg::Imported(p));
+                }
+                Ok(None) => skipped += 1,
                 Err(e) => {
                     failed += 1;
                     r.send(Msg::Failed(format!("{name}: {e}")));
@@ -488,18 +496,19 @@ pub fn now() -> NaiveDateTime {
 }
 
 /// Moves an already-written temp file into the library (year/month folders), dated `taken`.
-pub fn save_file(dest: &Path, name: &str, taken: NaiveDateTime, file: &Path) -> std::io::Result<bool> {
+/// Returns where it went, or `None` when the same file was already there.
+pub fn save_file(dest: &Path, name: &str, taken: NaiveDateTime, file: &Path) -> std::io::Result<Option<PathBuf>> {
     let size = std::fs::metadata(file)?.len();
     let Some(out) = target(dest, name, taken, size, true)? else {
         let _ = std::fs::remove_file(file);
-        return Ok(false);
+        return Ok(None);
     };
     if std::fs::rename(file, &out).is_err() {
         std::fs::copy(file, &out)?;
         let _ = std::fs::remove_file(file);
     }
     set_mtime(&out, taken);
-    Ok(true)
+    Ok(Some(out))
 }
 
 pub fn summary_for(verb: &str, copied: usize, skipped: usize, failed: usize, cancelled: bool) -> String {

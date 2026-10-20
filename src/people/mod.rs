@@ -14,11 +14,18 @@ use serde::{Deserialize, Serialize};
 
 pub use vision::{CLASSIFIER, DETECTOR, RECOGNIZER};
 
-/// Two faces this similar (cosine of their fingerprints) are taken to be the same person.
-/// SFace's own verification threshold is 0.363; a little stricter keeps strangers apart.
-const SAME_PERSON: f32 = 0.40;
-/// Groups whose average faces are this similar are merged after the first pass.
-const MERGE_GROUPS: f32 = 0.48;
+// Grouping settings, tuned on a real 3,500-photo family library (4,087 faces): the old
+// "join the nearest group average" approach put ~900 photos of different people in one group,
+// because a big group's average face looks like everyone.
+/// Two faces at least this similar (cosine of their SFace fingerprints) are linked.
+const LINK: f32 = 0.70;
+/// After grouping, a face whose average similarity to the rest of its group is below this
+/// only got in through a chain of look-alikes, and is taken out.
+const MIN_GROUP_AVERAGE: f32 = 0.55;
+/// Only clear faces are grouped: small or unsure ones have washed-out fingerprints that bridge
+/// different people. They stay in their photos, just not in a person.
+const GROUP_MIN_WIDTH: f32 = 0.06;
+const GROUP_MIN_SCORE: f32 = 0.88;
 /// Faces smaller than this (pixels, in the 1280px analysis copy) are too blurry to recognise.
 const MIN_FACE: f32 = 28.0;
 const ANALYSIS_SIZE: u32 = 1280;
@@ -269,66 +276,118 @@ fn normalized(v: &[f32]) -> Vec<f32> {
     v.iter().map(|x| x / n).collect()
 }
 
-/// Groups the faces of photos for which `present` is true into people. Faces are taken
-/// clearest first, each joining the most similar group or starting a new one; similar groups
-/// are then merged. Names and hidden flags come from the per-face maps.
-pub fn cluster(
-    index: &Index,
-    present: impl Fn(&Path) -> bool,
-    names: &HashMap<String, String>,
-    hidden: &HashSet<String>,
-) -> Vec<Person> {
-    struct F<'a> {
-        r: FaceRef,
-        emb: &'a [f32],
-        quality: f32,
-    }
-    let mut faces: Vec<F> = index
+/// Everything grouping needs, copied out of the app so it can run on a background thread.
+pub struct Snapshot {
+    faces: Vec<(FaceRef, Vec<f32>, f32)>,
+    names: HashMap<String, String>,
+    hidden: HashSet<String>,
+}
+
+/// The clear faces of photos for which `present` is true, plus the names and hidden flags.
+pub fn snapshot(index: &Index, present: impl Fn(&Path) -> bool, names: &HashMap<String, String>, hidden: &HashSet<String>) -> Snapshot {
+    let mut faces: Vec<(FaceRef, Vec<f32>, f32)> = index
         .entries
         .iter()
         .filter(|(p, _)| present(p))
         .flat_map(|(p, a)| {
-            a.faces.iter().enumerate().map(move |(i, f)| F {
-                r: FaceRef { path: p.clone(), index: i },
-                emb: &f.embedding,
-                quality: f.score * (f.bbox[2] * f.bbox[3]).sqrt(),
-            })
+            a.faces
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.bbox[2] >= GROUP_MIN_WIDTH && f.score >= GROUP_MIN_SCORE)
+                .map(move |(i, f)| (FaceRef { path: p.clone(), index: i }, normalized(&f.embedding), f.score * (f.bbox[2] * f.bbox[3]).sqrt()))
         })
         .collect();
-    faces.sort_by(|a, b| b.quality.total_cmp(&a.quality).then_with(|| a.r.path.cmp(&b.r.path)));
+    // Clearest first, so each person's cover is their best face; ties by path for stable output.
+    faces.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.path.cmp(&b.0.path)).then(a.0.index.cmp(&b.0.index)));
+    Snapshot { faces, names: names.clone(), hidden: hidden.clone() }
+}
 
-    // (sum of member fingerprints, members)
-    let mut groups: Vec<(Vec<f32>, Vec<usize>)> = Vec::new();
-    for (i, f) in faces.iter().enumerate() {
-        let best = groups
-            .iter()
-            .enumerate()
-            .map(|(g, (sum, _))| (g, dot(&normalized(sum), f.emb)))
-            .max_by(|a, b| a.1.total_cmp(&b.1));
-        match best {
-            Some((g, sim)) if sim >= SAME_PERSON => {
-                groups[g].0.iter_mut().zip(f.emb).for_each(|(s, e)| *s += e);
-                groups[g].1.push(i);
+/// Chinese whispers: link faces at least `LINK` similar, then let every face repeatedly take
+/// the label its links carry most weight for. Unlike averaging, a big group can't swallow
+/// everyone; then members only loosely tied to their group are dropped.
+fn group(faces: &[(FaceRef, Vec<f32>, f32)]) -> Vec<Vec<usize>> {
+    let n = faces.len();
+    let links: Vec<Vec<(usize, f32)>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            (0..n)
+                .filter(|&j| j != i)
+                .filter_map(|j| {
+                    let s = dot(&faces[i].1, &faces[j].1);
+                    (s >= LINK).then_some((j, s))
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut label: Vec<usize> = (0..n).collect();
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    for _ in 0..30 {
+        // Same shuffled order every run, so groups don't change from one launch to the next.
+        let mut order: Vec<usize> = (0..n).collect();
+        for k in (1..n).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            order.swap(k, (seed % (k as u64 + 1)) as usize);
+        }
+        let mut changed = false;
+        for &i in &order {
+            if links[i].is_empty() {
+                continue;
             }
-            _ => groups.push((f.emb.to_vec(), vec![i])),
+            let mut weight: HashMap<usize, f32> = HashMap::new();
+            for &(j, s) in &links[i] {
+                *weight.entry(label[j]).or_default() += s;
+            }
+            let best = weight.into_iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))).unwrap().0;
+            if best != label[i] {
+                label[i] = best;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
-    loop {
-        let centers: Vec<Vec<f32>> = groups.iter().map(|(s, _)| normalized(s)).collect();
-        let pair = (0..groups.len())
-            .flat_map(|a| (a + 1..groups.len()).map(move |b| (a, b)))
-            .find(|&(a, b)| dot(&centers[a], &centers[b]) >= MERGE_GROUPS);
-        let Some((a, b)) = pair else { break };
-        let (sum_b, members_b) = groups.remove(b);
-        groups[a].0.iter_mut().zip(&sum_b).for_each(|(s, e)| *s += e);
-        groups[a].1.extend(members_b);
+
+    let mut by_label: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, l) in label.into_iter().enumerate() {
+        by_label.entry(l).or_default().push(i);
     }
+    let mut groups = Vec::new();
+    for mut members in by_label.into_values() {
+        members.sort_unstable();
+        if members.len() >= 3 {
+            let mut sum = vec![0f32; faces[members[0]].1.len()];
+            for &i in &members {
+                sum.iter_mut().zip(&faces[i].1).for_each(|(s, e)| *s += e);
+            }
+            // Mean similarity to the others = (dot(face, sum) - 1) / (n - 1) for unit vectors.
+            let k = (members.len() - 1) as f32;
+            members.retain(|&i| (dot(&faces[i].1, &sum) - 1.0) / k >= MIN_GROUP_AVERAGE);
+        }
+        if !members.is_empty() {
+            groups.push(members);
+        }
+    }
+    groups
+}
+
+/// Groups faces into people. Names and hidden flags come from the per-face maps. Run it on a
+/// background thread: it compares every pair of faces.
+pub fn cluster(snapshot: Snapshot) -> Vec<Person> {
+    let Snapshot { faces, names, hidden } = snapshot;
+    let groups = group(&faces);
+    let faces: Vec<FaceRef> = faces.into_iter().map(|(r, _, _)| r).collect();
+    let names = &names;
+    let hidden = &hidden;
 
     // Groups the user gave the same name are one person.
     let mut people: Vec<Person> = Vec::new();
     let mut by_name: HashMap<String, usize> = HashMap::new();
-    for (_, members) in groups {
-        let refs: Vec<FaceRef> = members.iter().map(|&i| faces[i].r.clone()).collect();
+    for members in groups {
+        let refs: Vec<FaceRef> = members.iter().map(|&i| faces[i].clone()).collect();
         let mut votes: HashMap<&String, usize> = HashMap::new();
         for r in &refs {
             if let Some(n) = names.get(&r.key()) {

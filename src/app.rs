@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -149,6 +149,11 @@ struct TransferForm {
     export_selection: Vec<PathBuf>,
     use_selection: bool,
     by_month: bool,
+    /// Put this import in its own folder and album.
+    keep_separate: bool,
+    separate_name: String,
+    /// ...and keep it out of the Photos timeline.
+    separate_hide: bool,
 }
 
 impl Default for TransferForm {
@@ -170,6 +175,9 @@ impl Default for TransferForm {
             export_selection: Vec::new(),
             use_selection: false,
             by_month: true,
+            keep_separate: false,
+            separate_name: String::new(),
+            separate_hide: true,
         }
     }
 }
@@ -182,6 +190,10 @@ struct TransferJob {
     done: usize,
     total: usize,
     errors: Vec<String>,
+    /// Files this import added.
+    imported: Vec<PathBuf>,
+    /// Kept separate: (album name, the import's folder, keep out of the timeline).
+    separate: Option<(String, PathBuf, bool)>,
 }
 
 #[derive(Default)]
@@ -316,6 +328,8 @@ pub struct PhotosApp {
     /// Thumbnails the sidebar wants, added to whatever the page asks the loader for.
     sidebar_wanted: Vec<Job>,
     people_dirty: bool,
+    /// Set while a background grouping runs.
+    cluster_rx: Option<Receiver<Vec<Person>>>,
     people_index_dirty: bool,
     last_cluster: f64,
     last_index_save: f64,
@@ -403,6 +417,7 @@ impl PhotosApp {
             docs_open: true,
             sidebar_wanted: Vec::new(),
             people_dirty: true,
+            cluster_rx: None,
             people_index_dirty: false,
             last_cluster: 0.0,
             last_index_save: 0.0,
@@ -474,6 +489,8 @@ impl PhotosApp {
         self.analysis_gen.store(self.gen, Ordering::Relaxed);
         self.analysing = false;
         self.people.clear();
+        // A grouping still running for the previous folder would bring back its people.
+        self.cluster_rx = None;
         self.people_dirty = true;
         spawn_scan(dir.clone(), self.gen, self.scan_tx.clone(), ctx.clone());
         self.root = Some(dir);
@@ -527,7 +544,7 @@ impl PhotosApp {
             self.view_dirty = true;
             self.last_rebuild = now;
         }
-        self.poll_people(now);
+        self.poll_people(ctx, now);
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -589,7 +606,7 @@ impl PhotosApp {
                 let p = &self.photos[id];
                 let archived = self.store.is_archived(&p.path);
                 let on_page = match self.page {
-                    Page::Photos | Page::Recent => !archived,
+                    Page::Photos | Page::Recent => !archived && !self.store.is_separate(&p.path),
                     Page::Favorites => self.store.is_favorite(&p.path),
                     Page::Videos => !archived && p.is_video,
                     Page::Screenshots => !archived && is_screenshot(&p.path),
@@ -1054,6 +1071,7 @@ impl PhotosApp {
                 };
                 let name = album.name.clone();
                 let count = album.photos.len();
+                let separate_folder = album.photos.first().and_then(|p| self.store.separate.iter().find(|f| p.starts_with(f)).cloned());
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&name).size(30.0).color(TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1062,6 +1080,14 @@ impl PhotosApp {
                         }
                         if icon_button(ui, icon::PENCIL, 22.0, "Rename album").clicked() {
                             self.dialog = Some(Dialog::Rename { album: i, name: name.clone() });
+                        }
+                        // An import kept separate can join the timeline later.
+                        if let Some(folder) = separate_folder.clone() {
+                            let b = egui::Button::new(egui::RichText::new(format!("{}  Show in Photos timeline", icon::EYE)).color(ACCENT)).frame(false);
+                            if ui.add(b).on_hover_text("These photos are kept out of Photos; show them there too").clicked() {
+                                self.store.set_separate(&folder, false);
+                                self.view_dirty = true;
+                            }
                         }
                     });
                 });
@@ -1643,7 +1669,7 @@ impl PhotosApp {
         }
     }
 
-    fn poll_people(&mut self, now: f64) {
+    fn poll_people(&mut self, ctx: &egui::Context, now: f64) {
         while let Ok(msg) = self.analysis_rx.try_recv() {
             match msg {
                 people::Msg::Analysed { gen, path, analysis } if gen == self.gen => {
@@ -1668,26 +1694,43 @@ impl PhotosApp {
             self.people_index_dirty = false;
             self.last_index_save = now;
         }
-        // Grouping is quick but not free, so while analysis runs it happens every few seconds.
-        if self.people_dirty && !self.scanning && (!self.analysing || now - self.last_cluster > 3.0) {
+        if let Some(people) = self.cluster_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.cluster_rx = None;
+            self.apply_people(people);
+        }
+        // Grouping compares every pair of faces, so it runs in the background, and while
+        // analysis is still finding faces only every few seconds.
+        if self.people_dirty && self.cluster_rx.is_none() && !self.scanning && (!self.analysing || now - self.last_cluster > 10.0) {
             self.last_cluster = now;
-            self.recluster();
+            self.recluster(ctx);
         }
     }
 
-    /// Re-groups faces into people, keeping an open person open by following its cover face.
-    fn recluster(&mut self) {
+    /// Starts re-grouping faces into people on a background thread.
+    fn recluster(&mut self, ctx: &egui::Context) {
         self.people_dirty = false;
-        let open = match self.page {
-            Page::Person(i) => self.people.get(i).map(|p| p.cover.clone()),
-            _ => None,
-        };
-        self.people = people::cluster(
+        let snapshot = people::snapshot(
             &self.people_index,
             |p| self.path_index.contains_key(p),
             &self.store.face_names,
             &self.store.hidden_faces,
         );
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(people::cluster(snapshot));
+            ctx.request_repaint();
+        });
+        self.cluster_rx = Some(rx);
+    }
+
+    /// Takes in a new grouping, keeping an open person open by following its cover face.
+    fn apply_people(&mut self, people: Vec<Person>) {
+        let open = match self.page {
+            Page::Person(i) => self.people.get(i).map(|p| p.cover.clone()),
+            _ => None,
+        };
+        self.people = people;
         self.photo_tags.clear();
         self.doc_photos.clear();
         for (path, a) in &self.people_index.entries {
@@ -1934,7 +1977,7 @@ impl PhotosApp {
         }
         if toggle_hidden {
             self.store.hide_faces(&keys, !hidden);
-            self.recluster();
+            self.people_dirty = true;
             if !hidden {
                 self.set_page(Page::People);
             }
@@ -2420,7 +2463,17 @@ impl PhotosApp {
         let (tx, rx) = channel();
         let cancel = transfer::Cancel::default();
         start(cancel.clone(), transfer::Reporter::new(tx, ctx.clone()));
-        self.transfer_job = Some(TransferJob { rx, cancel, title, status: String::new(), done: 0, total: 0, errors: Vec::new() });
+        self.transfer_job = Some(TransferJob {
+            rx,
+            cancel,
+            title,
+            status: String::new(),
+            done: 0,
+            total: 0,
+            errors: Vec::new(),
+            imported: Vec::new(),
+            separate: None,
+        });
         self.transfer_result = None;
     }
 
@@ -2435,12 +2488,25 @@ impl PhotosApp {
                     job.total = total;
                 }
                 transfer::Msg::Failed(e) => job.errors.push(e),
+                transfer::Msg::Imported(p) => job.imported.push(p),
                 transfer::Msg::Done(s) => done = Some(s),
             }
         }
         if let Some(summary) = done {
             let job = self.transfer_job.take().unwrap();
             let imported = job.title.starts_with("Import");
+            let mut summary = summary;
+            if let Some((name, folder, hide)) = &job.separate {
+                if !job.imported.is_empty() {
+                    let i = self.store.create_album(name, &job.imported);
+                    summary += &format!(" Added to the album \"{}\"", self.store.albums[i].name);
+                    if *hide {
+                        self.store.set_separate(folder, true);
+                        summary += ", kept out of the Photos timeline";
+                    }
+                    summary += ".";
+                }
+            }
             self.transfer_result = Some((summary, job.errors));
             // New files are in the library folder; scan so they show up (and get analysed).
             if imported {
@@ -2476,6 +2542,7 @@ impl PhotosApp {
                 self.export_panel(ui, &ctx);
             } else {
                 self.import_panel(ui, &ctx);
+                self.past_imports_panel(ui);
             }
             ui.add_space(16.0);
             if let Some(job) = &self.transfer_job {
@@ -2635,8 +2702,30 @@ impl PhotosApp {
         Self::filter_fields(ui, &mut t.import_filter, "Name contains", "import");
         ready &= t.import_filter.date_error().is_none();
 
+        ui.add_space(8.0);
+        ui.checkbox(&mut t.keep_separate, "Keep this import separate (its own folder and album)");
+        if t.keep_separate {
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new("Name").color(TEXT_DIM));
+                let hint = egui::RichText::new("name for its folder and album").color(Color32::from_gray(105));
+                ui.add(egui::TextEdit::singleline(&mut t.separate_name).hint_text(hint).desired_width(300.0));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(24.0);
+                ui.checkbox(&mut t.separate_hide, "Keep it out of the Photos timeline (find it under Albums)");
+            });
+        }
         let label = t.source.label();
-        let dest = self.root.as_ref().map(|r| r.join("Imported").join(label));
+        let suggested = if t.keep_separate && t.separate_name.trim().is_empty() { Some(self.suggested_import_name()) } else { None };
+        let t = &mut self.transfer;
+        if let Some(s) = suggested {
+            t.separate_name = s;
+        }
+        let dest = self.root.as_ref().map(|r| {
+            let d = r.join("Imported").join(label);
+            if t.keep_separate { d.join(t.separate_name.trim()) } else { d }
+        });
         ui.add_space(8.0);
         match &dest {
             Some(d) => ui.label(egui::RichText::new(format!("Into {} (year/month folders). Files already there are skipped.", d.display())).color(TEXT_DIM).size(12.5)),
@@ -2656,9 +2745,14 @@ impl PhotosApp {
     fn start_import(&mut self, ctx: &egui::Context) {
         let Some(root) = &self.root else { return };
         let label = self.transfer.source.label();
-        let dest = root.join("Imported").join(label);
+        let mut dest = root.join("Imported").join(label);
+        let separate = self.separate_name();
+        if let Some(name) = &separate {
+            dest = dest.join(name);
+        }
         let t = self.transfer.clone();
         let title = format!("Importing from {label}");
+        let job_separate = separate.map(|name| (name, dest.clone(), t.separate_hide));
         self.start_transfer(title, ctx, move |cancel, r| match t.source {
                 ImportSource::Folder => transfer::spawn_folder_import(t.folder_source.unwrap(), dest, t.import_filter, cancel, r),
                 ImportSource::Takeout => transfer::spawn_takeout_import(t.takeout_sources, dest, t.import_filter, cancel, r),
@@ -2668,6 +2762,104 @@ impl PhotosApp {
                 #[cfg(not(target_os = "macos"))]
                 ImportSource::MacPhotos => r.send(transfer::Msg::Done("Mac Photos import needs macOS.".into())),
             });
+        if let Some(job) = &mut self.transfer_job {
+            job.separate = job_separate;
+        }
+    }
+
+    /// The folder/album name for an import kept separate (`None` when it isn't).
+    fn separate_name(&self) -> Option<String> {
+        let t = &self.transfer;
+        if !t.keep_separate {
+            return None;
+        }
+        let typed: String = t.separate_name.trim().chars().map(|c| if matches!(c, '/' | '\\' | ':') { '-' } else { c }).collect();
+        Some(if typed.is_empty() { self.suggested_import_name() } else { typed })
+    }
+
+    /// e.g. "takeout-20261020T053357Z" for one zip, "Google Takeout 2026-10-21" for several.
+    fn suggested_import_name(&self) -> String {
+        let t = &self.transfer;
+        let today = Local::now().format("%Y-%m-%d");
+        let stem = |p: &PathBuf| p.file_stem().map(|s| s.to_string_lossy().to_string());
+        match t.source {
+            ImportSource::Takeout if t.takeout_sources.len() == 1 => stem(&t.takeout_sources[0]),
+            ImportSource::Folder => t.folder_source.as_ref().and_then(stem),
+            _ => None,
+        }
+        .unwrap_or_else(|| format!("{} {today}", t.source.label()))
+    }
+
+    /// Folders earlier imports went into: each source folder, and named (separate) imports.
+    fn past_imports(&self) -> Vec<(String, PathBuf)> {
+        let Some(root) = &self.root else { return Vec::new() };
+        let is_year = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.len() == 4 && n.chars().all(|c| c.is_ascii_digit()));
+        let dirs = |p: &Path| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            v.sort();
+            v
+        };
+        let mut out = Vec::new();
+        for source in dirs(&root.join("Imported")) {
+            let label = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let named: Vec<PathBuf> = dirs(&source).into_iter().filter(|d| !is_year(d)).collect();
+            if dirs(&source).iter().any(|d| is_year(d)) {
+                out.push((label.clone(), source.clone()));
+            }
+            for d in named {
+                let name = d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                out.push((format!("{label} · {name}"), d));
+            }
+        }
+        out
+    }
+
+    /// "Past imports": keep an earlier import apart (album + out of the timeline), or bring it back.
+    fn past_imports_panel(&mut self, ui: &mut egui::Ui) {
+        let imports = self.past_imports();
+        if imports.is_empty() {
+            return;
+        }
+        ui.add_space(24.0);
+        ui.label(egui::RichText::new("Past imports").size(18.0).color(TEXT));
+        ui.label(egui::RichText::new("Keeping one separate puts its photos in an album of their own and out of the Photos timeline.").color(TEXT_DIM));
+        ui.add_space(6.0);
+        let folders: Vec<PathBuf> = imports.iter().map(|(_, f)| f.clone()).collect();
+        for (label, folder) in imports {
+            // A source folder's own photos, not those of the named imports inside it.
+            let inner: Vec<&PathBuf> = folders.iter().filter(|g| **g != folder && g.starts_with(&folder)).collect();
+            let photos: Vec<PathBuf> = self
+                .photos
+                .iter()
+                .filter(|p| p.path.starts_with(&folder) && !inner.iter().any(|g| p.path.starts_with(g)))
+                .map(|p| p.path.clone())
+                .collect();
+            // Separate when this folder, or one it's inside, is marked.
+            let separate = self.store.separate.iter().any(|f| folder.starts_with(f));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(icon::FOLDER).color(TEXT_DIM));
+                ui.label(egui::RichText::new(&label).color(TEXT));
+                ui.label(egui::RichText::new(format!("{} items", photos.len())).color(TEXT_DIM));
+                ui.add_space(8.0);
+                if separate {
+                    ui.label(egui::RichText::new("kept separate").color(ACCENT));
+                    if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Show in Photos", icon::EYE)).color(ACCENT)).frame(false)).clicked() {
+                        let marked: Vec<PathBuf> = self.store.separate.iter().filter(|f| folder.starts_with(f)).cloned().collect();
+                        for f in marked {
+                            self.store.set_separate(&f, false);
+                        }
+                        self.view_dirty = true;
+                    }
+                } else if ui.add_enabled(!photos.is_empty(), egui::Button::new(egui::RichText::new(format!("{}  Keep separate", icon::EYE_SLASH)).color(ACCENT)).frame(false)).clicked() {
+                    let name = label.rsplit(" · ").next().unwrap_or(&label).to_string();
+                    if !self.store.albums.iter().any(|a| a.name == name) {
+                        self.store.create_album(&name, &photos);
+                    }
+                    self.store.set_separate(&folder, true);
+                    self.view_dirty = true;
+                }
+            });
+        }
     }
 
     fn export_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2915,7 +3107,7 @@ impl PhotosApp {
                     if let Some(p) = self.people.get(person) {
                         let keys = p.keys();
                         self.store.name_faces(&keys, &name);
-                        self.recluster();
+                        self.people_dirty = true;
                     }
                 }
                 None => {}
@@ -3257,7 +3449,7 @@ impl PhotosApp {
         let Some(out) = std::env::var_os("BANANA_SCREENSHOT") else { return };
         let var = |k: &str| std::env::var(k).ok();
         let t = ctx.input(|i| i.time);
-        if t > 1.5 && !self.scanning && !self.analysing && !self.people_dirty && !self.debug_done {
+        if t > 1.5 && !self.scanning && !self.analysing && !self.people_dirty && self.cluster_rx.is_none() && !self.debug_done {
             self.debug_done = true;
             self.debug_done_at = t;
             match var("BANANA_PAGE").as_deref() {
@@ -3272,6 +3464,10 @@ impl PhotosApp {
                     if let Some(src) = var("BANANA_IMPORT") {
                         self.transfer.import_filter.from = var("BANANA_IMPORT_FROM").unwrap_or_default();
                         self.transfer.import_filter.to = var("BANANA_IMPORT_TO").unwrap_or_default();
+                        if let Some(name) = var("BANANA_IMPORT_SEPARATE") {
+                            self.transfer.keep_separate = true;
+                            self.transfer.separate_name = name;
+                        }
                         if src == "macphotos" {
                             self.transfer.source = ImportSource::MacPhotos;
                         } else if let Some(list) = src.strip_prefix("takeout:") {
