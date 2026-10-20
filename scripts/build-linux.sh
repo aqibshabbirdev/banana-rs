@@ -10,8 +10,8 @@ if [ -n "${DOCKER_PLATFORM:-}" ]; then
   PLATFORM_ARGS=(--platform "$DOCKER_PLATFORM")
 fi
 
-docker build "${PLATFORM_ARGS[@]}" -q -t banana-linux -f scripts/linux.Dockerfile scripts >/dev/null
-docker run --rm "${PLATFORM_ARGS[@]}" \
+docker build ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} -q -t banana-linux -f scripts/linux.Dockerfile scripts >/dev/null
+docker run --rm ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
   -v "$PWD":/src \
   -v banana-cargo-registry:/root/.cargo/registry \
   -e CARGO_TARGET_DIR=/src/target/linux \

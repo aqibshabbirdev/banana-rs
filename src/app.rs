@@ -1176,6 +1176,8 @@ impl PhotosApp {
                 "Looking for photos…"
             } else if self.query_pending.is_some() {
                 "Searching…"
+            } else if self.analysing && self.clip_model && !self.search.trim().is_empty() {
+                "No matches yet. Photos are still being analysed, and search by what's in them covers more as it goes."
             } else if !self.search.trim().is_empty() {
                 "No photos match your search."
             } else {
@@ -1713,13 +1715,20 @@ impl PhotosApp {
         if self.query_broken || self.query_pending.as_ref() == Some(&query) {
             return;
         }
-        if self.query_worker.is_none() {
-            let Some((model, tokenizer)) = clip::text_files() else { return };
-            self.query_worker = Some(clip::QueryWorker::spawn(model, tokenizer, ctx.clone()));
-        }
+        self.start_query_worker(ctx);
         if let Some(w) = &self.query_worker {
             w.request(query.clone());
             self.query_pending = Some(query);
+        }
+    }
+
+    /// Loads the text model in the background (after each scan), so the first search by
+    /// description doesn't wait for it.
+    fn start_query_worker(&mut self, ctx: &egui::Context) {
+        if self.query_worker.is_none() && !self.query_broken {
+            if let Some((model, tokenizer)) = clip::text_files() {
+                self.query_worker = Some(clip::QueryWorker::spawn(model, tokenizer, ctx.clone()));
+            }
         }
     }
 
@@ -1767,6 +1776,9 @@ impl PhotosApp {
         self.analysing = !jobs.is_empty();
         if self.analysing {
             people::spawn(jobs, self.gen, self.analysis_gen.clone(), models, self.analysis_tx.clone(), ctx.clone());
+        }
+        if self.clip_model {
+            self.start_query_worker(ctx);
         }
     }
 
