@@ -2503,8 +2503,9 @@ impl PhotosApp {
 
     /// Shared date / name / type filter fields.
     fn filter_fields(ui: &mut egui::Ui, f: &mut transfer::Filter, name_hint: &str, id: &str) {
+        // Hints in a clearly dimmer grey, so an empty box doesn't look filled in.
         let field = |ui: &mut egui::Ui, v: &mut String, hint: &str, w: f32| {
-            ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(w));
+            ui.add(egui::TextEdit::singleline(v).hint_text(egui::RichText::new(hint).color(Color32::from_gray(105))).desired_width(w));
         };
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("From").color(TEXT_DIM));
@@ -2636,10 +2637,18 @@ impl PhotosApp {
             .corner_radius(CornerRadius::same(18))
             .min_size(vec2(180.0, 40.0));
         if ui.add_enabled(ready, b).clicked() {
-            let dest = dest.unwrap();
-            let t = self.transfer.clone();
-            let title = format!("Importing from {label}");
-            self.start_transfer(title, ctx, move |cancel, r| match t.source {
+            self.start_import(ctx);
+        }
+    }
+
+    /// Starts importing from the chosen source into <library>/Imported/<source>.
+    fn start_import(&mut self, ctx: &egui::Context) {
+        let Some(root) = &self.root else { return };
+        let label = self.transfer.source.label();
+        let dest = root.join("Imported").join(label);
+        let t = self.transfer.clone();
+        let title = format!("Importing from {label}");
+        self.start_transfer(title, ctx, move |cancel, r| match t.source {
                 ImportSource::Folder => transfer::spawn_folder_import(t.folder_source.unwrap(), dest, t.import_filter, cancel, r),
                 ImportSource::Takeout => transfer::spawn_takeout_import(t.takeout_sources, dest, t.import_filter, cancel, r),
                 ImportSource::Google => transfer::google::spawn_picker_import(t.google, dest, t.import_filter, cancel, r),
@@ -2648,7 +2657,6 @@ impl PhotosApp {
                 #[cfg(not(target_os = "macos"))]
                 ImportSource::MacPhotos => r.send(transfer::Msg::Done("Mac Photos import needs macOS.".into())),
             });
-        }
     }
 
     fn export_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -3247,7 +3255,21 @@ impl PhotosApp {
                 Some("people") => self.set_page(Page::People),
                 Some("documents") => self.set_page(Page::Documents),
                 Some("locked") => self.set_page(Page::Locked),
-                Some("import") => self.set_page(Page::Transfer),
+                Some("import") => {
+                    self.set_page(Page::Transfer);
+                    // BANANA_IMPORT=macphotos|folder:<path> with BANANA_IMPORT_FROM / _TO starts one.
+                    if let Some(src) = var("BANANA_IMPORT") {
+                        self.transfer.import_filter.from = var("BANANA_IMPORT_FROM").unwrap_or_default();
+                        self.transfer.import_filter.to = var("BANANA_IMPORT_TO").unwrap_or_default();
+                        if src == "macphotos" {
+                            self.transfer.source = ImportSource::MacPhotos;
+                        } else if let Some(dir) = src.strip_prefix("folder:") {
+                            self.transfer.source = ImportSource::Folder;
+                            self.transfer.folder_source = Some(PathBuf::from(dir));
+                        }
+                        self.start_import(ctx);
+                    }
+                }
                 Some("export") => {
                     self.transfer.export = true;
                     self.set_page(Page::Transfer);
@@ -3294,7 +3316,7 @@ impl PhotosApp {
                 }
             }
         }
-        if self.debug_done && t > self.debug_done_at + 2.5 && !self.debug_shot_sent {
+        if self.debug_done && t > self.debug_done_at + 2.5 && !self.debug_shot_sent && self.transfer_job.is_none() && !self.scanning {
             self.debug_shot_sent = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }

@@ -65,9 +65,11 @@ pub fn spawn_import(dest: PathBuf, filter: Filter, favorites_only: bool, cancel:
             return;
         }
 
+        let mut in_library = 0;
         let picks: Vec<Pick> = autoreleasepool(|_| {
             let assets = unsafe { PHAsset::fetchAssetsWithOptions(None) };
             let n = unsafe { assets.count() };
+            in_library = n;
             r.status(format!("Checking {n} items in Photos…"));
             (0..n)
                 .filter_map(|i| {
@@ -91,8 +93,27 @@ pub fn spawn_import(dest: PathBuf, filter: Filter, favorites_only: bool, cancel:
                 .collect()
         });
 
+        // Dev-only: BANANA_IMPORT_LIMIT=n imports just the n newest matches (for testing on a
+        // real library without copying all of it).
+        #[cfg(debug_assertions)]
+        let picks = {
+            let mut picks = picks;
+            if let Some(n) = std::env::var("BANANA_IMPORT_LIMIT").ok().and_then(|v| v.parse().ok()) {
+                picks.sort_by(|a, b| b.taken.cmp(&a.taken));
+                picks.truncate(n);
+            }
+            picks
+        };
         let total = picks.len();
-        r.status(format!("Importing {total} items from Photos…"));
+        if total == 0 {
+            r.send(Msg::Done(if in_library == 0 {
+                "Nothing to import: Photos has no items this app can see. (With \"Limited\" access, only the photos you chose are visible.)".into()
+            } else {
+                format!("Nothing to import: none of the {in_library} items in Photos match these filters.")
+            }));
+            return;
+        }
+        r.status(format!("Importing {total} of {in_library} items from Photos…"));
         let manager = unsafe { PHAssetResourceManager::defaultManager() };
         let (mut copied, mut skipped, mut failed) = (0, 0, 0);
         for (i, pick) in picks.iter().enumerate() {
