@@ -84,6 +84,10 @@ Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folde
 
 The app icon is drawn by `cargo run --release --example make_icon -- assets/icon.png`.
 
+## Mac App Store build
+
+`APPSTORE=1 BUILD_NUMBER=<n> scripts/build-macos.sh` makes `dist/BananaPhotos-<version>.pkg` for App Store Connect. The app runs in the App Sandbox there (`macos/sandbox.entitlements`): it can read folders the user picks in the Open panel and the Pictures folder, and keeps access to the library folder across launches with security-scoped bookmarks (`src/access.rs`). It needs an **Apple Distribution** and a **Mac Installer Distribution** certificate (Xcode → Settings → Apple Accounts → Manage Certificates) and a Mac App Store provisioning profile for `com.bananars.photos`, which the script finds in `~/Library/Developer/Xcode/UserData/Provisioning Profiles`. `BUILD_NUMBER` must go up with every upload. Privacy policy: [PRIVACY.md](PRIVACY.md).
+
 ## People & pets, Documents and search models
 
 Face, pet and document recognition and search by description need five ONNX files and a tokenizer (about 210 MB in total). `scripts/fetch-models.sh` downloads them into `assets/models` and checks their SHA-256. The macOS and Linux build scripts run it and ship the models with the app.
