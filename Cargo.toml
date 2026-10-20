@@ -3,6 +3,8 @@ name = "banana-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Offline photo library: browse your photos grouped by date"
+license = "MIT"
+repository = "https://github.com/aqibshabbirdev/banana-rs"
 
 [dependencies]
 eframe = "0.31"

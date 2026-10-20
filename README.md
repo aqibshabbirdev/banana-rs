@@ -144,3 +144,7 @@ With no folder it opens the last folder you used, or your Pictures folder.
 | `src/thumbs.rs` | Worker threads that decode thumbnails (visible ones first) and full images, with a disk cache |
 | `src/store.rs` | Albums, favourites and archive, saved as JSON |
 | `src/app.rs` | The egui UI: sidebar, justified timeline, memories, albums, viewer, dialogs |
+
+## License
+
+MIT, see [LICENSE](LICENSE). The AI models it downloads keep their own licenses (MIT and Apache-2.0, listed above).
