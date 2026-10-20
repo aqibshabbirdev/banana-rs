@@ -155,8 +155,14 @@ pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
             &kCFTypeDictionaryValueCallBacks,
         ))?;
         let img = Cf::new(CGImageSourceCreateThumbnailAtIndex(src.0, 0, opts.0))?;
+        cgimage_to_image(img.0)
+    }
+}
 
-        let (w, h) = (CGImageGetWidth(img.0), CGImageGetHeight(img.0));
+/// Draws a CGImage (passed as a raw `CGImageRef`) into an RGBA buffer.
+pub fn cgimage_to_image(img: *const c_void) -> Option<DynamicImage> {
+    unsafe {
+        let (w, h) = (CGImageGetWidth(img), CGImageGetHeight(img));
         if w == 0 || h == 0 {
             return None;
         }
@@ -172,7 +178,7 @@ pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
             K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | K_CG_BITMAP_BYTE_ORDER_32_BIG,
         ))?;
         let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w as f64, height: h as f64 } };
-        CGContextDrawImage(ctx.0, rect, img.0);
+        CGContextDrawImage(ctx.0, rect, img);
         drop(ctx);
 
         RgbaImage::from_raw(w as u32, h as u32, pixels).map(DynamicImage::ImageRgba8)

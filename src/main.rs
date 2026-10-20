@@ -4,6 +4,7 @@ mod imageio;
 mod library;
 mod store;
 mod thumbs;
+mod video;
 
 use std::path::PathBuf;
 

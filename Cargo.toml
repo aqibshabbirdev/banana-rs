@@ -21,10 +21,26 @@ serde_json = "1"
 # (Linux: libheif-dev >= 1.17). Build without it: cargo build --no-default-features
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 libheif-rs = { version = "3", default-features = false, features = ["v1_17", "image"], optional = true }
+# Video thumbnails and playback off-mac (Linux: libgstreamer1.0-dev, libgstreamer-plugins-base1.0-dev).
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-pbutils = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
+
+# Video on macOS goes through AVFoundation (hardware decoding, audio), nothing to install.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-av-foundation = { version = "0.3", features = ["objc2-core-media", "objc2-core-video", "objc2-core-graphics"] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
 
 [features]
-default = ["heic"]
+default = ["heic", "video"]
 heic = ["dep:libheif-rs"]
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-pbutils", "dep:gstreamer-video"]
 
 [profile.dev.package."*"]
 # Image decoding is painfully slow without optimisations, even in debug builds.

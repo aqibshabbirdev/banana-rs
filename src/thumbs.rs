@@ -117,7 +117,11 @@ fn load_thumb(path: &Path, cached: &Path) -> Option<ColorImage> {
     if let Ok(img) = image::open(cached) {
         return Some(to_color_image(img));
     }
-    let thumb = decode(path, THUMB_SIZE)?;
+    let thumb = if crate::video::is_video(path) {
+        crate::video::thumbnail(path, THUMB_SIZE)?
+    } else {
+        decode(path, THUMB_SIZE)?
+    };
     let _ = thumb.to_rgb8().save_with_format(cached, image::ImageFormat::Jpeg);
     Some(to_color_image(thumb))
 }

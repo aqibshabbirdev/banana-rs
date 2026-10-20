@@ -27,6 +27,9 @@ pub struct Photo {
     pub added: NaiveDateTime,
     /// Width / height as displayed, i.e. after EXIF rotation. 1.0 if unreadable.
     pub aspect: f32,
+    pub is_video: bool,
+    /// Video length in seconds, when the backend could read it.
+    pub duration: Option<f32>,
 }
 
 pub enum ScanMsg {
@@ -53,7 +56,7 @@ pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egu
             .into_iter()
             .filter_entry(|e| e.depth() == 0 || wanted_entry(e))
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file() && is_image(e.path()))
+            .filter(|e| e.file_type().is_file() && (is_image(e.path()) || crate::video::is_video(e.path())))
             .map(|e| e.into_path())
             .collect();
 
@@ -77,6 +80,21 @@ fn read_photo(path: &Path) -> Option<Photo> {
     let mtime = modified.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let added = DateTime::<Local>::from(modified).naive_local();
 
+    if crate::video::is_video(path) {
+        let info = crate::video::probe(path);
+        let (taken, from_exif) = match info.as_ref().and_then(|i| i.created) {
+            Some(t) => (t, true),
+            None => (added, false),
+        };
+        let aspect = info
+            .as_ref()
+            .filter(|i| i.width > 0 && i.height > 0)
+            .map(|i| i.width as f32 / i.height as f32)
+            .unwrap_or(16.0 / 9.0);
+        let duration = info.map(|i| i.duration).filter(|d| *d > 0.0);
+        return Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect, is_video: true, duration });
+    }
+
     let exif = read_exif(path);
     let (taken, from_exif) = match exif.as_ref().and_then(exif_date) {
         Some(dt) => (dt, true),
@@ -88,7 +106,7 @@ fn read_photo(path: &Path) -> Option<Photo> {
         .map(|(w, h)| w as f32 / h as f32)
         .unwrap_or(1.0);
 
-    Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect })
+    Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect, is_video: false, duration: None })
 }
 
 /// Width and height the way the photo is shown, i.e. after rotation. Reads headers only.

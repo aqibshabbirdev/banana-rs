@@ -12,6 +12,7 @@ use egui_phosphor::regular as icon;
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::store::Store;
 use crate::thumbs::{cache_key, spawn_full, Job, Loaded, ThumbLoader};
+use crate::video;
 
 const MAX_TEXTURES: usize = 3000;
 const KEEP_TEXTURES: usize = 2000;
@@ -42,6 +43,7 @@ const BANANA: Color32 = Color32::from_rgb(253, 214, 99);
 enum Page {
     Photos,
     Favorites,
+    Videos,
     Screenshots,
     Recent,
     Archive,
@@ -58,7 +60,8 @@ impl Page {
             Page::Recent => 3,
             Page::Archive => 4,
             Page::Albums => 5,
-            Page::Album(i) => 6 + i,
+            Page::Videos => 6,
+            Page::Album(i) => 7 + i,
         }
     }
 }
@@ -129,6 +132,9 @@ struct Viewer {
     pos: usize,
     texture: Option<TextureHandle>,
     failed: bool,
+    /// Set when the open item is a video that the backend could start.
+    player: Option<video::Player>,
+    video_error: Option<String>,
 }
 
 pub struct PhotosApp {
@@ -357,6 +363,7 @@ impl PhotosApp {
                 let on_page = match self.page {
                     Page::Photos | Page::Recent => !archived,
                     Page::Favorites => self.store.is_favorite(&p.path),
+                    Page::Videos => !archived && p.is_video,
                     Page::Screenshots => !archived && is_screenshot(&p.path),
                     Page::Archive => archived,
                     Page::Albums => false,
@@ -415,8 +422,19 @@ impl PhotosApp {
 
     fn open_viewer(&mut self, pos: usize, ctx: &egui::Context) {
         let Some(&id) = self.order.get(pos) else { return };
-        self.viewer = Some(Viewer { pos, texture: None, failed: false });
-        spawn_full(self.photos[id].path.clone(), self.gen, id, self.full_tx.clone(), ctx.clone());
+        // Drop the previous player first so its sound stops before the next one starts.
+        self.viewer = None;
+        let path = self.photos[id].path.clone();
+        if self.photos[id].is_video {
+            let (player, video_error) = match video::Player::open(&path, ctx) {
+                Ok(p) => (Some(p), None),
+                Err(e) => (None, Some(e)),
+            };
+            self.viewer = Some(Viewer { pos, texture: None, failed: false, player, video_error });
+        } else {
+            self.viewer = Some(Viewer { pos, texture: None, failed: false, player: None, video_error: None });
+            spawn_full(path, self.gen, id, self.full_tx.clone(), ctx.clone());
+        }
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -674,6 +692,7 @@ impl PhotosApp {
 
         let items = [
             (icon::STAR, "Favorites", Page::Favorites),
+            (icon::PLAY_CIRCLE, "Videos", Page::Videos),
             (icon::DEVICE_MOBILE, "Screenshots & recordings", Page::Screenshots),
             (icon::CLOCK, "Recently added", Page::Recent),
             (icon::ARCHIVE, "Archive", Page::Archive),
@@ -731,6 +750,7 @@ impl PhotosApp {
         let title = match self.page {
             Page::Photos | Page::Albums => return,
             Page::Favorites => "Favorites",
+            Page::Videos => "Videos",
             Page::Screenshots => "Screenshots & recordings",
             Page::Recent => "Recently added",
             Page::Archive => "Archive",
@@ -783,6 +803,7 @@ impl PhotosApp {
                     Page::Photos => "No photos here. Use Open folder to pick where your photos are.",
                     Page::Favorites => "No favorites yet. Select photos and tap the heart, or press F in the viewer.",
                     Page::Screenshots => "No screenshots or screen recordings found.",
+                    Page::Videos => "No videos in this folder.",
                     Page::Archive => "Nothing archived. Archive photos to hide them from Photos.",
                     _ => "This album is empty. Go to Photos, select some, then add them to this album.",
                 }
@@ -863,6 +884,7 @@ impl PhotosApp {
                                 let is_sel = self.selected.contains(&id);
                                 let is_fav = self.store.is_favorite(&self.photos[id].path);
                                 let check = Rect::from_center_size(rect.min + vec2(18.0, 18.0), vec2(22.0, 22.0));
+                                let badge = self.photos[id].is_video.then(|| self.photos[id].duration.map(|d| video::format_duration(d as f64)).unwrap_or_default());
                                 draw_cell(
                                     ui,
                                     rect,
@@ -874,6 +896,7 @@ impl PhotosApp {
                                     is_sel,
                                     is_fav,
                                     resp.hovered() || selecting,
+                                    badge,
                                 );
 
                                 if resp.clicked() {
@@ -1149,18 +1172,23 @@ impl PhotosApp {
 
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, Color32::BLACK);
+        if self.photos[id].is_video {
+            self.video_frame(&ctx, typing);
+        }
         let v = self.viewer.as_ref().unwrap();
         // Show the blurry thumbnail while the full image decodes.
         let tex = v.texture.as_ref().or_else(|| self.thumbs.get(&id).map(|(t, _)| t));
         if let Some(tex) = tex {
             let size = tex.size_vec2();
-            let scale = (area.width() / size.x).min(area.height() / size.y).min(if v.texture.is_some() { 1.0 } else { f32::MAX });
+            // Photos never upscale past 100%; video frames and placeholder thumbnails fill the view.
+            let cap = if v.texture.is_some() && v.player.is_none() { 1.0 } else { f32::MAX };
+            let scale = (area.width() / size.x).min(area.height() / size.y).min(cap);
             let rect = Rect::from_center_size(area.center(), size * scale);
             ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
         if v.failed {
             ui.painter().text(area.center(), Align2::CENTER_CENTER, "Couldn't open this image", FontId::proportional(18.0), Color32::LIGHT_GRAY);
-        } else if v.texture.is_none() {
+        } else if v.texture.is_none() && v.video_error.is_none() {
             ui.put(Rect::from_center_size(area.center(), vec2(32.0, 32.0)), egui::Spinner::new());
         }
 
@@ -1180,6 +1208,10 @@ impl PhotosApp {
             }
         }
 
+        if self.photos[id].is_video {
+            self.video_controls(ui, area, &path);
+        }
+
         if toggle_fav {
             self.toggle_favorites(std::slice::from_ref(&path));
         }
@@ -1197,6 +1229,85 @@ impl PhotosApp {
         } else if let Some(p) = go {
             self.open_viewer(p, &ctx);
         }
+    }
+
+    /// Pulls the current video frame into the viewer texture and handles Space.
+    fn video_frame(&mut self, ctx: &egui::Context, typing: bool) {
+        let Some(v) = &mut self.viewer else { return };
+        let Some(p) = &mut v.player else { return };
+        if let Some(err) = p.error() {
+            v.video_error = Some(err);
+            v.player = None;
+            return;
+        }
+        if !typing && ctx.input(|i| i.key_pressed(Key::Space)) {
+            if p.playing() { p.pause() } else { p.play() }
+        }
+        if let Some(frame) = p.take_frame() {
+            match &mut v.texture {
+                Some(t) => t.set(frame, TextureOptions::LINEAR),
+                None => v.texture = Some(ctx.load_texture("video", frame, TextureOptions::LINEAR)),
+            }
+        }
+        p.ended();
+        // Frames are polled, so keep repainting while the video runs.
+        if p.playing() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Play/pause, time, seek bar, mute and "open in default player", over the bottom of the video.
+    fn video_controls(&mut self, ui: &mut egui::Ui, area: Rect, path: &std::path::Path) {
+        let Some(v) = &mut self.viewer else { return };
+
+        if let Some(err) = &v.video_error {
+            let c = area.center();
+            ui.painter().rect_filled(Rect::from_center_size(c, vec2(420.0, 150.0)), CornerRadius::same(16), Color32::from_black_alpha(190));
+            ui.painter().text(c + vec2(0.0, -40.0), Align2::CENTER_CENTER, "Can't play this video here", FontId::proportional(18.0), Color32::WHITE);
+            ui.painter().text(c + vec2(0.0, -14.0), Align2::CENTER_CENTER, err, FontId::proportional(13.0), TEXT_DIM);
+            let b = egui::Button::new(egui::RichText::new(format!("{}  Open in default player", icon::ARROW_SQUARE_OUT)).color(Color32::from_rgb(6, 46, 111)))
+                .fill(ACCENT)
+                .corner_radius(CornerRadius::same(18));
+            if ui.put(Rect::from_center_size(c + vec2(0.0, 30.0), vec2(240.0, 38.0)), b).clicked() {
+                video::open_externally(path);
+            }
+            return;
+        }
+        let Some(p) = &mut v.player else { return };
+
+        let bar = Rect::from_min_max(pos2(area.left() + 90.0, area.bottom() - 70.0), pos2(area.right() - 90.0, area.bottom() - 16.0));
+        ui.painter().rect_filled(bar, CornerRadius::same(14), Color32::from_black_alpha(160));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(14.0, 6.0))), |ui| {
+            ui.horizontal_centered(|ui| {
+                let (ic, hint) = if p.playing() { (icon::PAUSE, "Pause (Space)") } else { (icon::PLAY, "Play (Space)") };
+                if icon_button(ui, ic, 26.0, hint).clicked() {
+                    if p.playing() { p.pause() } else { p.play() }
+                }
+                let (pos, dur) = (p.position(), p.duration());
+                ui.label(
+                    egui::RichText::new(format!("{} / {}", video::format_duration(pos), video::format_duration(dur)))
+                        .color(Color32::WHITE)
+                        .monospace(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, icon::ARROW_SQUARE_OUT, 22.0, "Open in default player").clicked() {
+                        p.pause();
+                        video::open_externally(path);
+                    }
+                    let (ic, hint) = if p.muted() { (icon::SPEAKER_SLASH, "Unmute") } else { (icon::SPEAKER_HIGH, "Mute") };
+                    if icon_button(ui, ic, 22.0, hint).clicked() {
+                        let m = !p.muted();
+                        p.set_muted(m);
+                    }
+                    ui.spacing_mut().slider_width = (ui.available_width() - 16.0).max(60.0);
+                    let mut at = pos;
+                    let seek = ui.add(egui::Slider::new(&mut at, 0.0..=dur.max(0.01)).show_value(false));
+                    if seek.changed() {
+                        p.seek(at);
+                    }
+                });
+            });
+        });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1441,6 +1552,7 @@ fn draw_cell(
     selected: bool,
     favorite: bool,
     show_check: bool,
+    video_badge: Option<String>,
 ) {
     let painter = ui.painter();
     if selected {
@@ -1479,6 +1591,18 @@ fn draw_cell(
             painter.circle_stroke(c, 10.0, Stroke::new(2.0_f32, Color32::WHITE));
         }
     }
+    if let Some(text) = video_badge {
+        // Duration and a play mark in the top-right corner, like Google Photos.
+        let font = FontId::proportional(13.0);
+        let label = if text.is_empty() { icon::PLAY.to_string() } else { format!("{text}  {}", icon::PLAY) };
+        let galley = painter.layout_no_wrap(label, font, Color32::WHITE);
+        let pill = Rect::from_min_size(
+            pos2(img_rect.max.x - galley.size().x - 18.0, img_rect.min.y + 8.0),
+            galley.size() + vec2(12.0, 6.0),
+        );
+        painter.rect_filled(pill, CornerRadius::same(10), Color32::from_black_alpha(130));
+        painter.galley(pill.min + vec2(6.0, 3.0), galley, Color32::WHITE);
+    }
     if favorite {
         let p = pos2(img_rect.min.x + 8.0, img_rect.max.y - 6.0);
         painter.text(p + vec2(1.0, 1.0), Align2::LEFT_BOTTOM, "♥", FontId::proportional(18.0), Color32::from_black_alpha(140));
@@ -1489,7 +1613,10 @@ fn draw_cell(
 /// Every word must match the file name or some form of the date ("2024", "october", "oct", "sunday", "2024-10-06").
 fn matches_search(p: &Photo, terms: &[String]) -> bool {
     let name = p.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let date = p.taken.format("%Y %B %b %A %a %-d %Y-%m-%d").to_string().to_lowercase();
+    let mut date = p.taken.format("%Y %B %b %A %a %-d %Y-%m-%d").to_string().to_lowercase();
+    if p.is_video {
+        date += " video videos";
+    }
     terms.iter().all(|t| name.contains(t.as_str()) || date.contains(t.as_str()))
 }
 
@@ -1551,6 +1678,7 @@ impl PhotosApp {
             self.debug_done = true;
             match var("BANANA_PAGE").as_deref() {
                 Some("favorites") => self.set_page(Page::Favorites),
+                Some("videos") => self.set_page(Page::Videos),
                 Some("albums") => self.set_page(Page::Albums),
                 Some("archive") => self.set_page(Page::Archive),
                 Some("recent") => self.set_page(Page::Recent),
