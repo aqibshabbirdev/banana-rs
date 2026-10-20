@@ -15,7 +15,7 @@ An offline photo library written in Rust, laid out like Google Photos. Open a fo
 - **Documents**: receipts, notes, social media screenshots, recipes & menus, and ID cards are picked out into their own groups, listed in the sidebar like Google Photos. This uses CLIP on your computer.
 - **Locked Folder**: photos you move here are encrypted on this computer, removed from your folders, and hidden from Photos, search, albums and People. They open only with your passphrase (see [Locked Folder security](#locked-folder-security)).
 - **Import & export**: import from **Mac Photos** (PhotoKit, including iCloud-only items), **Google Photos** (sign in and pick), **Google Takeout** zips (dates restored from Takeout's JSON, album duplicates skipped), or any **folder or drive**. An import can be **kept separate**: it gets its own named folder and album, and optionally stays out of the Photos timeline. **Past imports** lists earlier imports so you can set one apart (or bring it back) later. Export copies into year/month folders or one folder. Both take filters: date range ("2020", "2020-05", "2020-05-17"), name, photos or videos, and for export also document kind, person, album and favourites. Files already there are skipped.
-- **Search**: by file name, a person's name, a document kind ("receipt", "menu", "passport"), or a date ("2024", "october", "sunday", "2024-10-06").
+- **Search**: by file name, a person's name, a document kind ("receipt", "menu", "passport"), or a date ("2024", "october", "sunday", "2024-10-06"). When none of those match, search goes by what's in the photos: "beach", "birthday cake", "red car", "mountains with snow" show the best matches first under "Results for …". This uses CLIP on your computer; nothing is uploaded.
 - **Viewer**: ← / → to move between photos, F to favourite, Esc to go back.
 - **Videos**: MP4, MOV, M4V, MKV, WebM, AVI, 3GP, MTS, WMV. They get poster-frame thumbnails with a duration badge, a Videos page, and in-app playback with sound: Space to play/pause, a seek bar, mute, and "open in default player". The recording date comes from the file's metadata. Phone videos shot in portrait show upright.
 - **Formats**: JPEG, PNG, WebP, GIF, BMP, TIFF, and **HEIC / HEIF / AVIF** (iPhone photos).
@@ -59,18 +59,21 @@ Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folde
 
 The app icon is drawn by `cargo run --release --example make_icon -- assets/icon.png`.
 
-## People & pets and Documents models
+## People & pets, Documents and search models
 
-Face, pet and document recognition need four ONNX files (about 140 MB in total). `scripts/fetch-models.sh` downloads them into `assets/models` and checks their SHA-256. The macOS and Linux build scripts run it and ship the models with the app.
+Face, pet and document recognition and search by description need five ONNX files and a tokenizer (about 210 MB in total). `scripts/fetch-models.sh` downloads them into `assets/models` and checks their SHA-256. The macOS and Linux build scripts run it and ship the models with the app.
 
 | Model | Job | License |
 |---|---|---|
 | YuNet (OpenCV Zoo) | finds faces and their landmarks | MIT |
 | SFace (OpenCV Zoo) | face fingerprints for grouping | Apache-2.0 |
 | MobileNetV2 (ONNX Model Zoo) | spots dogs and cats | Apache-2.0 |
-| CLIP ViT-B/32 image encoder (OpenAI, int8 by Xenova) | sorts documents into kinds | MIT |
+| CLIP ViT-B/32 image encoder (OpenAI, int8 by Xenova) | sorts documents into kinds; photo embeddings for search | MIT |
+| CLIP ViT-B/32 text encoder + tokenizer (OpenAI, int8 by Xenova) | turns search text into an embedding | MIT |
 
 Documents compares each photo's CLIP embedding with a few phrases per kind. Their text embeddings are precomputed in `src/people/doc_prompts.json` (made by `examples/make_doc_prompts.rs`), so the app doesn't need CLIP's text half. Without the CLIP file, Documents stays empty and People & pets still works.
+
+Search by description: analysis keeps each photo's CLIP image embedding in `clip.bin` in the data folder (8 bits per value plus a scale, about 0.5 KB per photo, keyed by path, modification time and size; not in `people.json`). A search that matches no file name, date, person or document kind is run through CLIP's text encoder on a background thread (the model loads on the first such search, then each search takes a few tens of milliseconds) and compared with every photo on the page by a dot product in memory. Photos scoring at least 0.22 and within 0.05 of the best match are shown, best first, up to 300. The CLIP tokenizer is a small pure-Rust BPE (`src/clip/tokenizer.rs`, tested against Hugging Face `tokenizers`) that reads `clip_tokenizer.json`. Without the text model and tokenizer, search sticks to names, dates and people.
 
 The app looks for them in a `models` folder next to the binary, `../share/banana-rs/models`, the app bundle's Resources, `~/.local/share/banana-rs/models`, or `$BANANA_MODELS`. Without them, everything else still works, and People & pets explains what's missing. They run with [tract](https://github.com/sonos/tract), a pure-Rust ONNX runtime, so nothing extra needs installing.
 
@@ -109,7 +112,8 @@ With no folder it opens the last folder you used, or your Pictures folder.
 | `src/library.rs` | Walks the folder; reads each photo's date, shape and EXIF rotation |
 | `src/imageio.rs` | macOS only: HEIC/HEIF/AVIF decoding through the system ImageIO framework |
 | `src/video/` | Video metadata, thumbnails and playback: `mac.rs` (AVFoundation), `gst.rs` (GStreamer), `none.rs` (no backend) |
-| `src/people/` | Face detection, alignment and fingerprints, dog/cat spotting, document kinds (`vision.rs`), the analysis cache and grouping into people (`mod.rs`) |
+| `src/clip/` | Search by description: CLIP tokenizer (`tokenizer.rs`), text encoder, photo embedding cache (`clip.bin`) and ranking (`mod.rs`, with tests) |
+| `src/people/` | Face detection, alignment and fingerprints, dog/cat spotting, document kinds and CLIP image embeddings (`vision.rs`), the analysis cache and grouping into people (`mod.rs`) |
 | `src/transfer/` | Import & export: filters, export, folder and Takeout import (`mod.rs`), Google Photos Picker sign-in (`google.rs`), Mac Photos via PhotoKit (`macphotos.rs`) |
 | `src/vault.rs` | Locked Folder: Argon2id key, XChaCha20-Poly1305 chunked encryption, verify-then-delete, restore (with tests) |
 | `src/thumbs.rs` | Worker threads that decode thumbnails (visible ones first) and full images, with a disk cache |

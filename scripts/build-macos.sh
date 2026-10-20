@@ -24,7 +24,7 @@ if [ ! -f assets/icon.png ]; then
   cargo run --release --example make_icon -- assets/icon.png
 fi
 
-echo "==> Fetching People & pets models"
+echo "==> Fetching People & pets, Documents and search models"
 scripts/fetch-models.sh assets/models
 
 echo "==> Making icon"

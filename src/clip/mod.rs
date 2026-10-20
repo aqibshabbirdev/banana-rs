@@ -331,4 +331,35 @@ mod tests {
             assert!(cos > 0.999, "{}: {cos}", p.prompt);
         }
     }
+
+    /// Prints how a folder of photos ranks for some searches, for tuning the thresholds:
+    ///   BANANA_EVAL_DIR=~/photos BANANA_EVAL_QUERIES="dog,cat" cargo test --release search_eval -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn search_eval() {
+        let dir = PathBuf::from(std::env::var("BANANA_EVAL_DIR").expect("BANANA_EVAL_DIR"));
+        let models = crate::people::models_dir().expect("models");
+        let vision = crate::people::vision::Models::load(&models).unwrap();
+        let (model, tok) = text_files().unwrap();
+        let text = TextEncoder::load(&model, &tok).unwrap();
+        let mut photos: Vec<(String, Stored)> = Vec::new();
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        for f in files {
+            let Some(img) = crate::thumbs::decode(&f, 1280) else { continue };
+            let Some(e) = vision.clip(&img.to_rgb8()).unwrap() else { continue };
+            photos.push((f.file_name().unwrap().to_string_lossy().into_owned(), Stored::quantize(0, 0, &e)));
+        }
+        let queries = std::env::var("BANANA_EVAL_QUERIES").unwrap_or_else(|_| "dog,cat,receipt,man in a suit".into());
+        for q in queries.split(',') {
+            let t = text.embed(q).unwrap();
+            let mut all: Vec<(f32, &str)> = photos.iter().map(|(n, s)| (s.dot(&t), n.as_str())).collect();
+            all.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let hits = rank(&t, photos.iter().map(|(_, s)| s).enumerate());
+            println!("\n{q:?}: {} results", hits.len());
+            for (s, n) in all.iter().take(hits.len() + 4) {
+                println!("  {s:.3} {n}");
+            }
+        }
+    }
 }

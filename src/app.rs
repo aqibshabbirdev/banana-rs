@@ -11,6 +11,7 @@ use eframe::egui::{
 };
 use egui_phosphor::regular as icon;
 
+use crate::clip;
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
@@ -302,6 +303,9 @@ pub struct PhotosApp {
     /// What the current page shows: filtered and sorted photo ids, grouped by day.
     page: Page,
     search: String,
+    /// Set when the page shows photos ranked by how well they fit the search text (CLIP),
+    /// because no file name, date or person matched it.
+    semantic: Option<String>,
     order: Vec<usize>,
     groups: Vec<Group>,
     memories: Vec<Memory>,
@@ -341,6 +345,16 @@ pub struct PhotosApp {
     analysis_tx: Sender<people::Msg>,
     /// Why People & pets can't run (models missing, failed to load).
     people_problem: Option<String>,
+    /// Photo embeddings for search by description, and whether the image model is installed.
+    clip_embeddings: clip::Embeddings,
+    clip_model: bool,
+    /// Turns search text into embeddings; started on the first search that needs it.
+    query_worker: Option<clip::QueryWorker>,
+    query_embeddings: HashMap<String, Vec<f32>>,
+    /// Search text waiting for its embedding.
+    query_pending: Option<String>,
+    /// The text model failed to load; search sticks to names, dates and people.
+    query_broken: bool,
     avatars: HashMap<String, Option<TextureHandle>>,
     show_hidden_people: bool,
 
@@ -399,6 +413,7 @@ impl PhotosApp {
             last_rebuild: 0.0,
             page: Page::Photos,
             search: String::new(),
+            semantic: None,
             order: Vec::new(),
             groups: Vec::new(),
             memories: Vec::new(),
@@ -428,6 +443,12 @@ impl PhotosApp {
             analysis_rx,
             analysis_tx,
             people_problem: None,
+            clip_embeddings: clip::Embeddings::load(),
+            clip_model: false,
+            query_worker: None,
+            query_embeddings: HashMap::new(),
+            query_pending: None,
+            query_broken: false,
             avatars: HashMap::new(),
             show_hidden_people: false,
             vault: None,
@@ -545,6 +566,7 @@ impl PhotosApp {
             self.last_rebuild = now;
         }
         self.poll_people(ctx, now);
+        self.poll_queries();
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -601,31 +623,58 @@ impl PhotosApp {
             _ => None,
         };
         let terms: Vec<String> = self.search.to_lowercase().split_whitespace().map(String::from).collect();
+        let on_page = |id: usize| {
+            let p = &self.photos[id];
+            let archived = self.store.is_archived(&p.path);
+            match self.page {
+                Page::Photos | Page::Recent => !archived && !self.store.is_separate(&p.path),
+                Page::Favorites => self.store.is_favorite(&p.path),
+                Page::Videos => !archived && p.is_video,
+                Page::Screenshots => !archived && is_screenshot(&p.path),
+                Page::Archive => archived,
+                Page::Albums | Page::People | Page::Locked | Page::Transfer => false,
+                Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
+                Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
+                Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
+                Page::Doc(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc == Some(kind)),
+                Page::Album(_) => album.as_ref().is_some_and(|a| a.contains(&p.path)),
+            }
+        };
         let mut order: Vec<usize> = (0..self.photos.len())
             .filter(|&id| {
-                let p = &self.photos[id];
-                let archived = self.store.is_archived(&p.path);
-                let on_page = match self.page {
-                    Page::Photos | Page::Recent => !archived && !self.store.is_separate(&p.path),
-                    Page::Favorites => self.store.is_favorite(&p.path),
-                    Page::Videos => !archived && p.is_video,
-                    Page::Screenshots => !archived && is_screenshot(&p.path),
-                    Page::Archive => archived,
-                    Page::Albums | Page::People | Page::Locked | Page::Transfer => false,
-                    Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
-                    Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
-                    Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
-                    Page::Doc(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc == Some(kind)),
-                    Page::Album(_) => album.as_ref().is_some_and(|a| a.contains(&p.path)),
-                };
-                on_page && (terms.is_empty() || matches_search(p, &terms, self.photo_tags.get(&p.path).map(String::as_str).unwrap_or("")))
+                on_page(id)
+                    && (terms.is_empty() || matches_search(&self.photos[id], &terms, self.photo_tags.get(&self.photos[id].path).map(String::as_str).unwrap_or("")))
             })
             .collect();
         order.sort_by(|&a, &b| self.when(b).cmp(&self.when(a)).then_with(|| self.photos[a].path.cmp(&self.photos[b].path)));
+
+        // Nothing matched by name, date or person: rank photos by how well they fit the text.
+        let mut semantic = None;
+        let mut need_query = None;
+        if order.is_empty() && !terms.is_empty() && !self.clip_embeddings.is_empty() {
+            let query = terms.join(" ");
+            match self.query_embeddings.get(&query) {
+                Some(q) => {
+                    let candidates = (0..self.photos.len()).filter(|&id| on_page(id)).filter_map(|id| {
+                        let p = &self.photos[id];
+                        self.clip_embeddings.get(&p.path, p.mtime, p.size).map(|e| (id, e))
+                    });
+                    order = clip::rank(q, candidates);
+                    semantic = Some(self.search.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
+                None => need_query = Some(query),
+            }
+        }
+        self.semantic = semantic;
+        match need_query {
+            Some(q) => self.request_query(q, ctx),
+            None => self.query_pending = None,
+        }
         self.order = order;
 
         self.groups.clear();
-        for pos in 0..self.order.len() {
+        // Search results are best first, so they aren't split into days.
+        for pos in (0..self.order.len()).filter(|_| self.semantic.is_none()) {
             let date = self.when(self.order[pos]).date();
             match self.groups.last_mut() {
                 Some(g) if g.date == date => g.len += 1,
@@ -771,6 +820,18 @@ impl PhotosApp {
             *y += h;
             pending.clear();
         };
+
+        if let Some(q) = &self.semantic {
+            rows.push(LaidRow { y, h: MONTH_H, kind: RowKind::Month(format!("Results for “{q}”")) });
+            y += MONTH_H;
+            for pos in 0..self.order.len() {
+                pending.push((pos, self.photos[self.order[pos]].aspect.clamp(0.4, 3.0), None));
+                let natural: f32 = pending.iter().map(|(_, a, _)| a * target).sum::<f32>() + GAP * (pending.len() - 1) as f32;
+                if natural >= width {
+                    flush(&mut pending, &mut rows, &mut y, true);
+                }
+            }
+        }
 
         let this_year = Local::now().year();
         let mut month = None;
@@ -1113,6 +1174,8 @@ impl PhotosApp {
         if self.order.is_empty() {
             let msg = if self.scanning {
                 "Looking for photos…"
+            } else if self.query_pending.is_some() {
+                "Searching…"
             } else if !self.search.trim().is_empty() {
                 "No photos match your search."
             } else {
@@ -1645,6 +1708,40 @@ impl PhotosApp {
         self.loader.set_wanted(all);
     }
 
+    /// Asks the background text encoder for the search text's embedding (once per text).
+    fn request_query(&mut self, query: String, ctx: &egui::Context) {
+        if self.query_broken || self.query_pending.as_ref() == Some(&query) {
+            return;
+        }
+        if self.query_worker.is_none() {
+            let Some((model, tokenizer)) = clip::text_files() else { return };
+            self.query_worker = Some(clip::QueryWorker::spawn(model, tokenizer, ctx.clone()));
+        }
+        if let Some(w) = &self.query_worker {
+            w.request(query.clone());
+            self.query_pending = Some(query);
+        }
+    }
+
+    fn poll_queries(&mut self) {
+        let Some(w) = &self.query_worker else { return };
+        while let Ok((text, result)) = w.rx.try_recv() {
+            match result {
+                Ok(v) => {
+                    self.query_embeddings.insert(text.clone(), v);
+                }
+                Err(e) => {
+                    eprintln!("search by description is off: {e}");
+                    self.query_broken = true;
+                }
+            }
+            if self.query_pending.as_ref() == Some(&text) {
+                self.query_pending = None;
+                self.view_dirty = true;
+            }
+        }
+    }
+
     /// Starts finding faces and pets in photos not analysed yet (runs after every scan).
     fn start_analysis(&mut self, ctx: &egui::Context) {
         let Some(models) = people::models_dir() else {
@@ -1654,10 +1751,14 @@ impl PhotosApp {
             return;
         };
         self.people_problem = None;
+        self.clip_model = models.join(people::CLIP).is_file();
         let jobs: Vec<people::Job> = self
             .photos
             .iter()
-            .filter(|p| !p.is_video && !self.people_index.is_current(&p.path, p.mtime, p.size))
+            .filter(|p| {
+                !p.is_video
+                    && (!self.people_index.is_current(&p.path, p.mtime, p.size) || (self.clip_model && !self.clip_embeddings.has(&p.path, p.mtime, p.size)))
+            })
             .map(|p| people::Job { path: p.path.clone(), mtime: p.mtime, size: p.size })
             .collect();
         self.analysed = 0;
@@ -1672,7 +1773,11 @@ impl PhotosApp {
     fn poll_people(&mut self, ctx: &egui::Context, now: f64) {
         while let Ok(msg) = self.analysis_rx.try_recv() {
             match msg {
-                people::Msg::Analysed { gen, path, analysis } if gen == self.gen => {
+                people::Msg::Analysed { gen, path, mut analysis } if gen == self.gen => {
+                    // Photos CLIP couldn't read get an empty entry, so they aren't retried every launch.
+                    if let Some(e) = analysis.clip.take().or_else(|| self.clip_model.then(Vec::new)) {
+                        self.clip_embeddings.insert(path.clone(), analysis.mtime, analysis.size, &e);
+                    }
                     self.people_index.entries.insert(path, analysis);
                     self.analysed += 1;
                     self.people_dirty = true;
@@ -1692,6 +1797,9 @@ impl PhotosApp {
         if self.people_index_dirty && (!self.analysing || now - self.last_index_save > 10.0) {
             self.people_index.save();
             self.people_index_dirty = false;
+            if self.clip_embeddings.dirty {
+                self.clip_embeddings.save();
+            }
             self.last_index_save = now;
         }
         if let Some(people) = self.cluster_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {

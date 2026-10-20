@@ -1,7 +1,7 @@
 //! People & pets: find faces, group them into people, and spot dogs and cats. Everything runs
 //! on this machine; results are cached in `people.json` so each photo is analysed once.
 
-mod vision;
+pub(crate) mod vision;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

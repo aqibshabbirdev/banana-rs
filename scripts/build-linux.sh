@@ -18,4 +18,4 @@ docker run --rm "${PLATFORM_ARGS[@]}" \
   banana-linux cargo build --release "$@"
 
 scripts/fetch-models.sh target/linux/release/models >/dev/null
-echo "Built target/linux/release/banana-rs (People & pets models in target/linux/release/models)"
+echo "Built target/linux/release/banana-rs (People & pets, Documents and search models in target/linux/release/models)"
