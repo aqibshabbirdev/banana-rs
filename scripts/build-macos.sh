@@ -92,6 +92,17 @@ else
 fi
 codesign --verify --strict "$APP"
 
+# The app gets its own ticket too, so it opens without a network check even after it's copied
+# out of the dmg (it's an offline app).
+if [ -n "$NOTARY_PROFILE" ]; then
+  echo "==> Notarizing the app (a few minutes)"
+  ZIP="$(mktemp -d)/app.zip"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+  xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+  rm -f "$ZIP"
+fi
+
 echo "==> Making dmg"
 DMG="$DIST/BananaPhotos-$VERSION-arm64.dmg"
 STAGE="$(mktemp -d)"
@@ -105,7 +116,7 @@ if [ "$SIGN_ID" != "-" ]; then
   codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
 fi
 if [ -n "$NOTARY_PROFILE" ]; then
-  echo "==> Notarizing (a few minutes)"
+  echo "==> Notarizing the dmg (a few minutes)"
   xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
   xcrun stapler staple "$DMG"
   spctl --assess --type open --context context:primary-signature -v "$DMG"

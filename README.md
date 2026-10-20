@@ -10,9 +10,8 @@ Download from the [latest release](https://github.com/aqibshabbirdev/banana-rs/r
 
 **Mac (Apple Silicon, macOS 11 or newer)**
 
-1. Download `BananaPhotos-<version>-arm64.dmg`, open it, and drag **Banana Photos** to **Applications**.
-2. The app isn't notarized by Apple, so the first time, right-click it in Applications and choose **Open**, then **Open** again. (Or run `xattr -cr "/Applications/Banana Photos.app"` in Terminal.)
-3. Click the folder button and choose where your photos are. It reads them in place and never moves or changes them.
+1. Download `BananaPhotos-<version>-arm64.dmg`, open it, and drag **Banana Photos** to **Applications**. It's signed and notarized by Apple, so it opens with a normal double-click, even offline.
+2. Click the folder button and choose where your photos are. It reads them in place and never moves or changes them.
 
 **Linux (Ubuntu 24.04+, Debian 13+; x86_64 or arm64)**
 
@@ -79,7 +78,7 @@ scripts/build-macos.sh
 
 This builds `dist/Banana Photos.app` and `dist/BananaPhotos-<version>-arm64.dmg`. It needs only Xcode command line tools and Rust. HEIC uses macOS's own ImageIO and videos use AVFoundation (hardware decoding), so there is no libheif, GStreamer or Homebrew dependency. Open the dmg and drag the app to Applications. It runs on macOS 11 (Big Sur) or newer.
 
-The app is ad-hoc signed. On another Mac, the first launch needs right-click → **Open** (or `xattr -cr "/Applications/Banana Photos.app"`). To skip that, sign and notarize it with an Apple Developer ID: create a **Developer ID Application** certificate (Xcode → Settings → Accounts → Manage Certificates), store notarization credentials once with `xcrun notarytool store-credentials notary`, then run `NOTARY_PROFILE=notary scripts/build-macos.sh`. The script finds the certificate in the keychain (or takes `SIGN_ID="Developer ID Application: …"`), signs the app and dmg, notarizes, and staples the ticket.
+Without a Developer ID the app is ad-hoc signed, and on another Mac the first launch needs right-click → **Open** (or `xattr -cr "/Applications/Banana Photos.app"`). Release builds are signed and notarized with an Apple Developer ID: create a **Developer ID Application** certificate (Xcode → Settings → Accounts → Manage Certificates), store notarization credentials once with `xcrun notarytool store-credentials notary`, then run `NOTARY_PROFILE=notary scripts/build-macos.sh`. The script finds the certificate in the keychain (or takes `SIGN_ID="Developer ID Application: …"`), signs the app and dmg, notarizes both, and staples the tickets (the app's own ticket lets it open offline after it's copied out of the dmg).
 
 Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folder, and inside an Apple Photos library (`*.photoslibrary`) only the original photos are read, not its thumbnails.
 
