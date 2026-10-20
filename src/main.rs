@@ -21,10 +21,22 @@ fn main() -> eframe::Result {
     // `banana-rs ~/Pictures` opens that folder; otherwise the last folder, then the Pictures folder.
     let start = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_dir());
 
+    // Dev-only: BANANA_WINDOW=1440x900 sets the window size (for App Store screenshots).
+    #[cfg(debug_assertions)]
+    let size = std::env::var("BANANA_WINDOW")
+        .ok()
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some([w.parse().ok()?, h.parse().ok()?])
+        })
+        .unwrap_or([1200.0, 800.0]);
+    #[cfg(not(debug_assertions))]
+    let size = [1200.0, 800.0];
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Banana Photos")
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size(size)
             .with_min_inner_size([480.0, 360.0]),
         ..Default::default()
     };
