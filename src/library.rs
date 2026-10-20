@@ -10,7 +10,7 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-const EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
+const EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff", "dng"];
 #[cfg(any(target_os = "macos", feature = "heic"))]
 const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "hif", "avif"];
 #[cfg(not(any(target_os = "macos", feature = "heic")))]
@@ -112,7 +112,7 @@ pub fn read_photo(path: &Path) -> Option<Photo> {
 /// Width and height the way the photo is shown, i.e. after rotation. Reads headers only.
 fn display_size(path: &Path, exif: Option<&exif::Exif>) -> Option<(u32, u32)> {
     #[cfg(target_os = "macos")]
-    if is_heif(path) {
+    if is_heif(path) || is_raw(path) {
         return crate::imageio::dimensions(path);
     }
     let (w, h) = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()?;
@@ -134,6 +134,13 @@ fn wanted_entry(e: &walkdir::DirEntry) -> bool {
         .and_then(|p| p.extension())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("photoslibrary"));
     !in_photos_library || name == "originals" || name == "Masters"
+}
+
+/// Camera RAW (Adobe DNG, which phones also save). macOS decodes it with ImageIO; elsewhere
+/// it's listed and imported but shows without a thumbnail.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn is_raw(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dng"))
 }
 
 pub fn is_heif(path: &Path) -> bool {

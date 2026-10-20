@@ -2599,8 +2599,19 @@ impl PhotosApp {
                         }
                     }
                 });
-                for s in &t.takeout_sources {
-                    ui.label(egui::RichText::new(s.display().to_string()).color(TEXT_DIM).size(12.5));
+                // A full Takeout is dozens of zips; show a one-line summary, the list on demand.
+                if !t.takeout_sources.is_empty() {
+                    let bytes: u64 = t.takeout_sources.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+                    let what = if t.takeout_sources.len() == 1 && t.takeout_sources[0].is_dir() {
+                        t.takeout_sources[0].display().to_string()
+                    } else {
+                        format!("{} .zip file{} · {}", t.takeout_sources.len(), if t.takeout_sources.len() == 1 { "" } else { "s" }, human_bytes(bytes))
+                    };
+                    egui::CollapsingHeader::new(egui::RichText::new(what).color(TEXT)).id_salt("takeout files").show(ui, |ui| {
+                        for s in &t.takeout_sources {
+                            ui.label(egui::RichText::new(s.display().to_string()).color(TEXT_DIM).size(12.5));
+                        }
+                    });
                 }
                 ready &= !t.takeout_sources.is_empty();
             }
@@ -3257,12 +3268,15 @@ impl PhotosApp {
                 Some("locked") => self.set_page(Page::Locked),
                 Some("import") => {
                     self.set_page(Page::Transfer);
-                    // BANANA_IMPORT=macphotos|folder:<path> with BANANA_IMPORT_FROM / _TO starts one.
+                    // BANANA_IMPORT=macphotos|takeout:<zip>,<zip>|folder:<path> with BANANA_IMPORT_FROM / _TO starts one.
                     if let Some(src) = var("BANANA_IMPORT") {
                         self.transfer.import_filter.from = var("BANANA_IMPORT_FROM").unwrap_or_default();
                         self.transfer.import_filter.to = var("BANANA_IMPORT_TO").unwrap_or_default();
                         if src == "macphotos" {
                             self.transfer.source = ImportSource::MacPhotos;
+                        } else if let Some(list) = src.strip_prefix("takeout:") {
+                            self.transfer.source = ImportSource::Takeout;
+                            self.transfer.takeout_sources = list.split(',').map(PathBuf::from).collect();
                         } else if let Some(dir) = src.strip_prefix("folder:") {
                             self.transfer.source = ImportSource::Folder;
                             self.transfer.folder_source = Some(PathBuf::from(dir));

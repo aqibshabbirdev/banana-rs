@@ -130,7 +130,7 @@ fn load_thumb(path: &Path, cached: &Path) -> Option<ColorImage> {
 /// than `max_side` on its longest edge.
 pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
     #[cfg(target_os = "macos")]
-    if crate::library::is_heif(path) {
+    if crate::library::is_heif(path) || crate::library::is_raw(path) {
         return crate::imageio::decode(path, max_side);
     }
     let img = decode_any(path)?;
@@ -149,7 +149,7 @@ pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
 pub fn decode_bytes(bytes: &[u8], name: &Path, max_side: u32) -> Option<DynamicImage> {
     use image::ImageDecoder;
     #[cfg(target_os = "macos")]
-    if crate::library::is_heif(name) {
+    if crate::library::is_heif(name) || crate::library::is_raw(name) {
         return crate::imageio::decode_data(bytes, max_side);
     }
     let _ = name;

@@ -66,6 +66,10 @@ impl Filter {
         }
     }
 
+    pub fn has_dates(&self) -> bool {
+        !self.from.trim().is_empty() || !self.to.trim().is_empty()
+    }
+
     pub fn date_ok(&self, t: NaiveDateTime) -> bool {
         let d = t.date();
         parse_date(&self.from, false).is_none_or(|from| d >= from) && parse_date(&self.to, true).is_none_or(|to| d <= to)
@@ -284,8 +288,25 @@ struct Timestamp {
     timestamp: String,
 }
 
-/// (folder inside the archive, original file name) → when it was taken.
-type Dates = HashMap<(String, String), NaiveDateTime>;
+/// When each photo in a Takeout was taken, from the JSON sidecars.
+#[derive(Default)]
+struct Dates {
+    /// (folder inside the archive, original file name) → time.
+    by_title: HashMap<(String, String), NaiveDateTime>,
+    /// folder → (lower-case name without extension, time), for the fuzzier lookups.
+    by_dir: HashMap<String, Vec<(String, NaiveDateTime)>>,
+}
+
+fn stem_lower(name: &str) -> String {
+    Path::new(name).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()
+}
+
+impl Dates {
+    fn insert(&mut self, dir: String, title: String, t: NaiveDateTime) {
+        self.by_dir.entry(dir.clone()).or_default().push((stem_lower(&title), t));
+        self.by_title.insert((dir, title), t);
+    }
+}
 
 fn sidecar_date(bytes: &[u8]) -> Option<(String, NaiveDateTime)> {
     let s: Sidecar = serde_json::from_slice(bytes).ok()?;
@@ -301,11 +322,13 @@ fn split(path: &str) -> (String, String) {
     }
 }
 
-/// The sidecar date for a media file: by its own name, or for "IMG_1-edited.jpg" and
-/// "IMG_1(1).jpg" the original's.
+/// The sidecar date for a media file: by its own name; for "IMG_1-edited.jpg" and
+/// "IMG_1(1).jpg" the original's; for the video half of a Live/Motion photo ("IMG_1.MP4") the
+/// photo's ("IMG_1.HEIC"); and for names Takeout cut short, the sidecar whose full title starts
+/// with them.
 fn takeout_date(dates: &Dates, dir: &str, name: &str) -> Option<NaiveDateTime> {
     let key = |n: &str| (dir.to_string(), n.to_string());
-    if let Some(t) = dates.get(&key(name)) {
+    if let Some(t) = dates.by_title.get(&key(name)) {
         return Some(*t);
     }
     let p = Path::new(name);
@@ -320,7 +343,20 @@ fn takeout_date(dates: &Dates, dir: &str, name: &str) -> Option<NaiveDateTime> {
     if let Some(i) = base.rfind('(').filter(|_| base.ends_with(')')) {
         base.truncate(i);
     }
-    dates.get(&key(&format!("{base}{ext}"))).copied()
+    if let Some(t) = dates.by_title.get(&key(&format!("{base}{ext}"))) {
+        return Some(*t);
+    }
+    let in_dir = dates.by_dir.get(dir)?;
+    let base = base.to_lowercase();
+    if let Some((_, t)) = in_dir.iter().find(|(s, _)| *s == base) {
+        return Some(*t);
+    }
+    if base.chars().count() >= 30 {
+        if let Some((_, t)) = in_dir.iter().find(|(s, _)| s.starts_with(&base)) {
+            return Some(*t);
+        }
+    }
+    None
 }
 
 /// Google Takeout download: one or more .zip files or an already-extracted folder. Dates come
@@ -333,19 +369,21 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
 
         // Pass 1: every sidecar's date, and the media files to consider.
         r.status("Reading Takeout's photo dates…");
-        let mut dates: Dates = HashMap::new();
-        // (source index, path inside source, size)
-        let mut media: Vec<(usize, String, u64)> = Vec::new();
+        let mut dates = Dates::default();
+        // (source index, path inside source, size, the file's own modified time)
+        let mut media: Vec<(usize, String, u64, Option<NaiveDateTime>)> = Vec::new();
         for (si, src) in sources.iter().enumerate() {
             if src.is_dir() {
                 for e in walkdir::WalkDir::new(src).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()) {
                     let rel = e.path().strip_prefix(src).unwrap_or(e.path()).to_string_lossy().replace('\\', "/");
                     if rel.ends_with(".json") {
                         if let Some((title, t)) = std::fs::read(e.path()).ok().and_then(|b| sidecar_date(&b)) {
-                            dates.insert((split(&rel).0, title), t);
+                            dates.insert(split(&rel).0, title, t);
                         }
                     } else if is_media(e.path()) {
-                        media.push((si, rel, e.metadata().map(|m| m.len()).unwrap_or(0)));
+                        let meta = e.metadata().ok();
+                        let mtime = meta.as_ref().and_then(|m| m.modified().ok()).map(|t| DateTime::<Local>::from(t).naive_local());
+                        media.push((si, rel, meta.map(|m| m.len()).unwrap_or(0), mtime));
                     }
                 }
             } else {
@@ -364,11 +402,15 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
                         let mut buf = Vec::new();
                         if entry.read_to_end(&mut buf).is_ok() {
                             if let Some((title, t)) = sidecar_date(&buf) {
-                                dates.insert((split(&name).0, title), t);
+                                dates.insert(split(&name).0, title, t);
                             }
                         }
                     } else if is_media(Path::new(&name)) {
-                        media.push((si, name, entry.size()));
+                        let mtime = entry.last_modified().and_then(|d| {
+                            NaiveDate::from_ymd_opt(d.year() as i32, d.month() as u32, d.day() as u32)?
+                                .and_hms_opt(d.hour() as u32, d.minute() as u32, d.second() as u32)
+                        });
+                        media.push((si, name, entry.size(), mtime));
                     }
                 }
             }
@@ -376,9 +418,19 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
 
         // Pass 2: filter and copy.
         let mut plan: Vec<(usize, String, u64, NaiveDateTime)> = Vec::new();
-        for (si, rel, size) in media {
+        let mut undated_left_out = 0;
+        for (si, rel, size, mtime) in media {
             let (dir, name) = split(&rel);
-            let taken = takeout_date(&dates, &dir, &name).unwrap_or_else(|| Local::now().naive_local());
+            let taken = match takeout_date(&dates, &dir, &name) {
+                Some(t) => t,
+                // No sidecar: with a date filter we can't tell, so leave it out (and say so);
+                // otherwise import it and let the library read its EXIF date.
+                None if filter.has_dates() => {
+                    undated_left_out += 1;
+                    continue;
+                }
+                None => mtime.unwrap_or_else(now),
+            };
             if filter.matches(&name, taken, crate::video::is_video(Path::new(&name))) && seen.insert((name.clone(), size)) {
                 plan.push((si, rel, size, taken));
             }
@@ -422,7 +474,11 @@ pub fn spawn_takeout_import(sources: Vec<PathBuf>, dest: PathBuf, filter: Filter
             }
             r.send(Msg::Progress { done: n + 1, total });
         }
-        r.send(Msg::Done(summary("Imported", copied, skipped, failed, cancel.cancelled())));
+        let mut done = summary("Imported", copied, skipped, failed, cancel.cancelled());
+        if undated_left_out > 0 {
+            done += &format!(" {undated_left_out} file{} without a Takeout date left out by the date filter.", if undated_left_out == 1 { "" } else { "s" });
+        }
+        r.send(Msg::Done(done));
     });
 }
 
@@ -549,11 +605,17 @@ mod tests {
 
     #[test]
     fn takeout_dates_follow_edited_and_numbered_copies() {
-        let mut d: Dates = HashMap::new();
+        let mut d = Dates::default();
         let t = NaiveDate::from_ymd_opt(2019, 7, 1).unwrap().and_hms_opt(10, 0, 0).unwrap();
-        d.insert(("Takeout/Google Photos/Trip".into(), "IMG_1.jpg".into()), t);
-        assert_eq!(takeout_date(&d, "Takeout/Google Photos/Trip", "IMG_1-edited.jpg"), Some(t));
-        assert_eq!(takeout_date(&d, "Takeout/Google Photos/Trip", "IMG_1(1).jpg"), Some(t));
+        let dir = "Takeout/Google Photos/Trip";
+        d.insert(dir.into(), "IMG_1.jpg".into(), t);
+        d.insert(dir.into(), "IMG_7.HEIC".into(), t);
+        d.insert(dir.into(), "Screenshot_2024-05-01-10-11-12-345_com.example.someverylongapp.jpg".into(), t);
+        assert_eq!(takeout_date(&d, dir, "IMG_1-edited.jpg"), Some(t));
+        assert_eq!(takeout_date(&d, dir, "IMG_1(1).jpg"), Some(t));
+        assert_eq!(takeout_date(&d, dir, "IMG_7.MP4"), Some(t), "Live Photo video takes the photo's date");
+        assert_eq!(takeout_date(&d, dir, "Screenshot_2024-05-01-10-11-12-345_com.example.j.jpg"), None);
+        assert_eq!(takeout_date(&d, dir, "Screenshot_2024-05-01-10-11-12-345_com.exampl.jpg"), Some(t), "name cut short by Takeout");
         assert_eq!(takeout_date(&d, "Takeout/Google Photos/Other", "IMG_1.jpg"), None);
     }
 }
