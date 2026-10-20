@@ -15,6 +15,7 @@ use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
 use crate::thumbs::{cache_key, spawn_full, Job, Loaded, ThumbLoader};
+use crate::transfer;
 use crate::vault;
 use crate::video;
 
@@ -54,6 +55,7 @@ enum Page {
     Documents,
     Doc(DocKind),
     Locked,
+    Transfer,
     Screenshots,
     Recent,
     Archive,
@@ -76,6 +78,7 @@ impl Page {
             Page::Pets(Pet::Cat) => 9,
             Page::Documents => 10,
             Page::Locked => 16,
+            Page::Transfer => 17,
             Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
             Page::Person(i) => 101 + 2 * i,
@@ -94,6 +97,91 @@ enum Dialog {
     MoveToLocked { paths: Vec<PathBuf>, pass: String, error: Option<String> },
     /// Vault item ids to delete for good.
     DeleteLocked(Vec<String>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ImportSource {
+    #[default]
+    MacPhotos,
+    Google,
+    Takeout,
+    Folder,
+}
+
+impl ImportSource {
+    /// Also the subfolder of "Imported" the files go into.
+    fn label(self) -> &'static str {
+        match self {
+            ImportSource::MacPhotos => "Mac Photos",
+            ImportSource::Google => "Google Photos",
+            ImportSource::Takeout => "Google Takeout",
+            ImportSource::Folder => "Folder",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum DocFilter {
+    #[default]
+    Any,
+    Only,
+    Not,
+    Kind(DocKind),
+}
+
+/// What the Import & export page has filled in.
+#[derive(Clone)]
+struct TransferForm {
+    export: bool,
+    source: ImportSource,
+    import_filter: transfer::Filter,
+    favorites_only: bool,
+    takeout_sources: Vec<PathBuf>,
+    folder_source: Option<PathBuf>,
+    google: transfer::google::ClientConfig,
+    google_setup_open: bool,
+    export_filter: transfer::Filter,
+    export_doc: DocFilter,
+    export_person: Option<String>,
+    export_album: Option<usize>,
+    export_favorites: bool,
+    /// Photos selected when "Export" was chosen from the selection bar.
+    export_selection: Vec<PathBuf>,
+    use_selection: bool,
+    by_month: bool,
+}
+
+impl Default for TransferForm {
+    fn default() -> Self {
+        Self {
+            export: false,
+            source: if cfg!(target_os = "macos") { ImportSource::MacPhotos } else { ImportSource::Takeout },
+            import_filter: Default::default(),
+            favorites_only: false,
+            takeout_sources: Vec::new(),
+            folder_source: None,
+            google: transfer::google::ClientConfig::load(),
+            google_setup_open: false,
+            export_filter: Default::default(),
+            export_doc: DocFilter::Any,
+            export_person: None,
+            export_album: None,
+            export_favorites: false,
+            export_selection: Vec::new(),
+            use_selection: false,
+            by_month: true,
+        }
+    }
+}
+
+struct TransferJob {
+    rx: Receiver<transfer::Msg>,
+    cancel: transfer::Cancel,
+    title: String,
+    status: String,
+    done: usize,
+    total: usize,
+    errors: Vec<String>,
 }
 
 #[derive(Default)]
@@ -252,6 +340,11 @@ pub struct PhotosApp {
     vault_job: Option<VaultJob>,
     vault_notice: Option<String>,
 
+    transfer: TransferForm,
+    transfer_job: Option<TransferJob>,
+    /// Summary and per-file errors of the last finished import or export.
+    transfer_result: Option<(String, Vec<String>)>,
+
     scan_rx: Receiver<ScanMsg>,
     scan_tx: Sender<ScanMsg>,
     scan_total: usize,
@@ -330,6 +423,9 @@ impl PhotosApp {
             vault_form: VaultForm::default(),
             vault_job: None,
             vault_notice: None,
+            transfer: TransferForm::default(),
+            transfer_job: None,
+            transfer_result: None,
             scan_rx,
             scan_tx,
             scan_total: 0,
@@ -498,7 +594,7 @@ impl PhotosApp {
                     Page::Videos => !archived && p.is_video,
                     Page::Screenshots => !archived && is_screenshot(&p.path),
                     Page::Archive => archived,
-                    Page::Albums | Page::People | Page::Locked => false,
+                    Page::Albums | Page::People | Page::Locked | Page::Transfer => false,
                     Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                     Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                     Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
@@ -760,6 +856,7 @@ impl PhotosApp {
 
     fn selection_bar(&mut self, ui: &mut egui::Ui) {
         let paths = self.selected_paths();
+        let mut go_transfer = false;
         if icon_button(ui, icon::X, 22.0, "Clear selection (Esc)").clicked() {
             self.selected.clear();
         }
@@ -780,6 +877,12 @@ impl PhotosApp {
             if self.vault_job.is_none() && icon_button(ui, icon::LOCK_SIMPLE, 22.0, "Move to Locked Folder").clicked() {
                 self.dialog = Some(Dialog::MoveToLocked { paths: paths.clone(), pass: String::new(), error: None });
             }
+            if icon_button(ui, icon::EXPORT, 22.0, "Export…").clicked() {
+                self.transfer.export_selection = paths.clone();
+                self.transfer.use_selection = true;
+                self.transfer.export = true;
+                go_transfer = true;
+            }
             let archived = paths.iter().all(|p| self.store.is_archived(p));
             if icon_button(ui, icon::ARCHIVE, 22.0, if archived { "Unarchive" } else { "Archive" }).clicked() {
                 self.toggle_archive(&paths);
@@ -794,6 +897,9 @@ impl PhotosApp {
                 self.toggle_favorites(&paths);
             }
         });
+        if go_transfer {
+            self.set_page(Page::Transfer);
+        }
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -871,6 +977,7 @@ impl PhotosApp {
             (icon::CLOCK, "Recently added", Page::Recent),
             (icon::ARCHIVE, "Archive", Page::Archive),
             (icon::LOCK_SIMPLE, "Locked Folder", Page::Locked),
+            (icon::ARROWS_DOWN_UP, "Import & export", Page::Transfer),
         ];
         for (ic, label, page) in items {
             let on = self.page == page || (page == Page::People && matches!(self.page, Page::Person(_) | Page::Pets(_)));
@@ -924,7 +1031,7 @@ impl PhotosApp {
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
         let title = match self.page {
-            Page::Photos | Page::Albums | Page::People | Page::Locked => return,
+            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer => return,
             Page::Person(i) => {
                 self.person_header(ui, i);
                 return;
@@ -2269,6 +2376,357 @@ impl PhotosApp {
         }
     }
 
+    /// Library photos that the export filters pick, in timeline order.
+    fn export_matches(&self) -> Vec<usize> {
+        let t = &self.transfer;
+        if t.use_selection && !t.export_selection.is_empty() {
+            return t.export_selection.iter().filter_map(|p| self.path_index.get(p).copied()).collect();
+        }
+        let person = t.export_person.as_ref().and_then(|n| self.people.iter().find(|p| p.name.as_ref() == Some(n)));
+        let album: Option<HashSet<&PathBuf>> = t.export_album.and_then(|i| self.store.albums.get(i)).map(|a| a.photos.iter().collect());
+        let want_name = t.export_filter.name.trim().to_lowercase();
+        let mut ids: Vec<usize> = (0..self.photos.len())
+            .filter(|&id| {
+                let p = &self.photos[id];
+                let f = &t.export_filter;
+                if !f.date_ok(p.taken) || !f.kind_ok(p.is_video) {
+                    return false;
+                }
+                if !want_name.is_empty() {
+                    let file = p.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                    let tags = self.photo_tags.get(&p.path).map(String::as_str).unwrap_or("");
+                    if !file.contains(&want_name) && !tags.contains(&want_name) {
+                        return false;
+                    }
+                }
+                let doc = self.people_index.entries.get(&p.path).and_then(|a| a.doc);
+                let doc_ok = match t.export_doc {
+                    DocFilter::Any => true,
+                    DocFilter::Only => doc.is_some(),
+                    DocFilter::Not => doc.is_none(),
+                    DocFilter::Kind(k) => doc == Some(k),
+                };
+                doc_ok
+                    && person.is_none_or(|pp| pp.photos.contains(&p.path))
+                    && album.as_ref().is_none_or(|a| a.contains(&p.path))
+                    && (!t.export_favorites || self.store.is_favorite(&p.path))
+            })
+            .collect();
+        ids.sort_by(|&a, &b| self.photos[b].taken.cmp(&self.photos[a].taken));
+        ids
+    }
+
+    fn start_transfer(&mut self, title: String, ctx: &egui::Context, start: impl FnOnce(transfer::Cancel, transfer::Reporter)) {
+        let (tx, rx) = channel();
+        let cancel = transfer::Cancel::default();
+        start(cancel.clone(), transfer::Reporter::new(tx, ctx.clone()));
+        self.transfer_job = Some(TransferJob { rx, cancel, title, status: String::new(), done: 0, total: 0, errors: Vec::new() });
+        self.transfer_result = None;
+    }
+
+    fn poll_transfer(&mut self, ctx: &egui::Context) {
+        let Some(job) = &mut self.transfer_job else { return };
+        let mut done = None;
+        while let Ok(msg) = job.rx.try_recv() {
+            match msg {
+                transfer::Msg::Status(s) => job.status = s,
+                transfer::Msg::Progress { done, total } => {
+                    job.done = done;
+                    job.total = total;
+                }
+                transfer::Msg::Failed(e) => job.errors.push(e),
+                transfer::Msg::Done(s) => done = Some(s),
+            }
+        }
+        if let Some(summary) = done {
+            let job = self.transfer_job.take().unwrap();
+            let imported = job.title.starts_with("Import");
+            self.transfer_result = Some((summary, job.errors));
+            // New files are in the library folder; scan so they show up (and get analysed).
+            if imported {
+                if let Some(root) = self.root.clone() {
+                    self.open_folder(root, ctx);
+                }
+            }
+        }
+    }
+
+    fn transfer_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.label(egui::RichText::new("Import & export").size(30.0).color(TEXT));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            for (export, label, ic) in [(false, "Import", icon::TRAY_ARROW_DOWN), (true, "Export", icon::EXPORT)] {
+                let on = self.transfer.export == export;
+                let b = egui::Button::new(egui::RichText::new(format!("{ic}  {label}")).size(15.0).color(if on { PILL_TEXT } else { TEXT }))
+                    .fill(if on { PILL_BG } else { Color32::TRANSPARENT })
+                    .stroke(Stroke::new(1.0_f32, if on { PILL_BG } else { Color32::from_gray(90) }))
+                    .corner_radius(CornerRadius::same(18))
+                    .min_size(vec2(120.0, 36.0));
+                if ui.add(b).clicked() {
+                    self.transfer.export = export;
+                }
+            }
+        });
+        ui.add_space(12.0);
+
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.set_max_width(820.0);
+            if self.transfer.export {
+                self.export_panel(ui, &ctx);
+            } else {
+                self.import_panel(ui, &ctx);
+            }
+            ui.add_space(16.0);
+            if let Some(job) = &self.transfer_job {
+                let frac = if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 };
+                let text = if job.total > 0 { format!("{}: {} of {}", job.title, job.done, job.total) } else { job.title.clone() };
+                ui.add(egui::ProgressBar::new(frac).desired_width(520.0).text(text).animate(job.total == 0));
+                if !job.status.is_empty() {
+                    ui.label(egui::RichText::new(&job.status).color(TEXT_DIM));
+                }
+                if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Stop", icon::STOP)).color(ACCENT)).frame(false)).clicked() {
+                    job.cancel.cancel();
+                }
+            }
+            if let Some((summary, errors)) = &self.transfer_result {
+                ui.label(egui::RichText::new(summary).color(ACCENT));
+                for e in errors.iter().take(20) {
+                    ui.label(egui::RichText::new(e).color(HEART).size(12.5));
+                }
+                if errors.len() > 20 {
+                    ui.label(egui::RichText::new(format!("…and {} more", errors.len() - 20)).color(TEXT_DIM));
+                }
+            }
+        });
+    }
+
+    /// Shared date / name / type filter fields.
+    fn filter_fields(ui: &mut egui::Ui, f: &mut transfer::Filter, name_hint: &str, id: &str) {
+        let field = |ui: &mut egui::Ui, v: &mut String, hint: &str, w: f32| {
+            ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(w));
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("From").color(TEXT_DIM));
+            field(ui, &mut f.from, "2020 or 2020-05-17", 140.0);
+            ui.label(egui::RichText::new("to").color(TEXT_DIM));
+            field(ui, &mut f.to, "2024-12", 140.0);
+            ui.add_space(10.0);
+            field(ui, &mut f.name, name_hint, 200.0);
+            ui.add_space(10.0);
+            egui::ComboBox::from_id_salt(("kind", id))
+                .selected_text(match f.kind {
+                    transfer::MediaKind::All => "Photos & videos",
+                    transfer::MediaKind::Photos => "Photos only",
+                    transfer::MediaKind::Videos => "Videos only",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut f.kind, transfer::MediaKind::All, "Photos & videos");
+                    ui.selectable_value(&mut f.kind, transfer::MediaKind::Photos, "Photos only");
+                    ui.selectable_value(&mut f.kind, transfer::MediaKind::Videos, "Videos only");
+                });
+        });
+        if let Some(e) = f.date_error() {
+            ui.label(egui::RichText::new(e).color(HEART));
+        }
+    }
+
+    fn import_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut sources = vec![
+            (ImportSource::Google, icon::CLOUD_ARROW_DOWN, "Google Photos", "Sign in and pick photos"),
+            (ImportSource::Takeout, icon::FILE_ZIP, "Google Takeout", "Your whole library, as .zip files"),
+            (ImportSource::Folder, icon::HARD_DRIVES, "Folder or drive", "Phone, camera card, USB drive"),
+        ];
+        if cfg!(target_os = "macos") {
+            sources.insert(0, (ImportSource::MacPhotos, icon::IMAGES, "Mac Photos", "The Photos app on this Mac"));
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(12.0, 12.0);
+            for (src, ic, title, sub) in sources {
+                let on = self.transfer.source == src;
+                let (rect, resp) = ui.allocate_exact_size(vec2(188.0, 92.0), Sense::click());
+                ui.painter().rect_filled(rect, CornerRadius::same(14), if on { PILL_BG } else if resp.hovered() { HOVER_BG } else { FIELD_BG });
+                let color = if on { PILL_TEXT } else { TEXT };
+                ui.painter().text(rect.left_top() + vec2(16.0, 14.0), Align2::LEFT_TOP, ic, FontId::proportional(24.0), color);
+                ui.painter().text(rect.left_top() + vec2(16.0, 46.0), Align2::LEFT_TOP, title, FontId::proportional(15.0), color);
+                ui.painter().text(rect.left_top() + vec2(16.0, 68.0), Align2::LEFT_TOP, sub, FontId::proportional(11.5), TEXT_DIM);
+                if resp.clicked() {
+                    self.transfer.source = src;
+                }
+            }
+        });
+        ui.add_space(14.0);
+
+        let t = &mut self.transfer;
+        let mut ready = self.root.is_some() && self.transfer_job.is_none();
+        match t.source {
+            ImportSource::MacPhotos => {
+                ui.label(egui::RichText::new("macOS will ask once for access to Photos. Photos kept only in iCloud are downloaded; edited photos come in edited.").color(TEXT_DIM));
+                ui.checkbox(&mut t.favorites_only, "Only favourites");
+            }
+            ImportSource::Google => {
+                ui.label(
+                    egui::RichText::new("Google only lets apps import photos you pick: sign in, choose photos in Google's picker, and they're downloaded here. For your whole library, use Google Takeout.")
+                        .color(TEXT_DIM),
+                );
+                if !t.google.is_set() || t.google_setup_open {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("One-time setup: your own Google client ID").color(TEXT));
+                    ui.label(egui::RichText::new(transfer::google::SETUP_STEPS).color(TEXT_DIM).size(12.5));
+                    ui.add(egui::TextEdit::singleline(&mut t.google.client_id).hint_text("Client ID").desired_width(520.0));
+                    ui.add(egui::TextEdit::singleline(&mut t.google.client_secret).hint_text("Client secret").password(true).desired_width(520.0));
+                    if ui.button("Save").clicked() && t.google.is_set() {
+                        t.google.save();
+                        t.google_setup_open = false;
+                    }
+                } else if ui.add(egui::Button::new(egui::RichText::new("Change Google client ID").color(ACCENT)).frame(false)).clicked() {
+                    t.google_setup_open = true;
+                }
+                ready &= t.google.is_set();
+            }
+            ImportSource::Takeout => {
+                ui.label(egui::RichText::new("Download from takeout.google.com (Google Photos), then choose the .zip files or the unzipped folder. Dates are restored from Takeout's .json files.").color(TEXT_DIM));
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{}  Choose .zip files…", icon::FILE_ZIP)).clicked() {
+                        if let Some(files) = rfd::FileDialog::new().add_filter("Takeout", &["zip"]).pick_files() {
+                            t.takeout_sources = files;
+                        }
+                    }
+                    if ui.button(format!("{}  Choose unzipped folder…", icon::FOLDER_OPEN)).clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            t.takeout_sources = vec![dir];
+                        }
+                    }
+                });
+                for s in &t.takeout_sources {
+                    ui.label(egui::RichText::new(s.display().to_string()).color(TEXT_DIM).size(12.5));
+                }
+                ready &= !t.takeout_sources.is_empty();
+            }
+            ImportSource::Folder => {
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{}  Choose folder or drive…", icon::FOLDER_OPEN)).clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            t.folder_source = Some(dir);
+                        }
+                    }
+                    if let Some(d) = &t.folder_source {
+                        ui.label(egui::RichText::new(d.display().to_string()).color(TEXT_DIM));
+                    }
+                });
+                ready &= t.folder_source.is_some();
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Only import").color(TEXT));
+        Self::filter_fields(ui, &mut t.import_filter, "Name contains", "import");
+        ready &= t.import_filter.date_error().is_none();
+
+        let label = t.source.label();
+        let dest = self.root.as_ref().map(|r| r.join("Imported").join(label));
+        ui.add_space(8.0);
+        match &dest {
+            Some(d) => ui.label(egui::RichText::new(format!("Into {} (year/month folders). Files already there are skipped.", d.display())).color(TEXT_DIM).size(12.5)),
+            None => ui.label(egui::RichText::new("Open a library folder first.").color(HEART)),
+        };
+        ui.add_space(8.0);
+        let b = egui::Button::new(egui::RichText::new(format!("{}  Start import", icon::TRAY_ARROW_DOWN)).color(Color32::from_rgb(6, 46, 111)))
+            .fill(ACCENT)
+            .corner_radius(CornerRadius::same(18))
+            .min_size(vec2(180.0, 40.0));
+        if ui.add_enabled(ready, b).clicked() {
+            let dest = dest.unwrap();
+            let t = self.transfer.clone();
+            let title = format!("Importing from {label}");
+            self.start_transfer(title, ctx, move |cancel, r| match t.source {
+                ImportSource::Folder => transfer::spawn_folder_import(t.folder_source.unwrap(), dest, t.import_filter, cancel, r),
+                ImportSource::Takeout => transfer::spawn_takeout_import(t.takeout_sources, dest, t.import_filter, cancel, r),
+                ImportSource::Google => transfer::google::spawn_picker_import(t.google, dest, t.import_filter, cancel, r),
+                #[cfg(target_os = "macos")]
+                ImportSource::MacPhotos => transfer::macphotos::spawn_import(dest, t.import_filter, t.favorites_only, cancel, r),
+                #[cfg(not(target_os = "macos"))]
+                ImportSource::MacPhotos => r.send(transfer::Msg::Done("Mac Photos import needs macOS.".into())),
+            });
+        }
+    }
+
+    fn export_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let named: Vec<String> = self.people.iter().filter_map(|p| p.name.clone()).collect();
+        let albums: Vec<String> = self.store.albums.iter().map(|a| a.name.clone()).collect();
+        let t = &mut self.transfer;
+        if !t.export_selection.is_empty() {
+            ui.checkbox(&mut t.use_selection, format!("Only the {} photos I selected", t.export_selection.len()));
+            ui.add_space(6.0);
+        }
+        let filters_on = !(t.use_selection && !t.export_selection.is_empty());
+        ui.add_enabled_ui(filters_on, |ui| {
+            ui.label(egui::RichText::new("Export").color(TEXT));
+            Self::filter_fields(ui, &mut t.export_filter, "Name or person", "export");
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("export doc")
+                    .selected_text(match t.export_doc {
+                        DocFilter::Any => "Documents and photos".to_string(),
+                        DocFilter::Only => "Documents only".to_string(),
+                        DocFilter::Not => "No documents".to_string(),
+                        DocFilter::Kind(k) => k.label().to_string(),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut t.export_doc, DocFilter::Any, "Documents and photos");
+                        ui.selectable_value(&mut t.export_doc, DocFilter::Only, "Documents only");
+                        ui.selectable_value(&mut t.export_doc, DocFilter::Not, "No documents");
+                        for k in DocKind::ALL {
+                            ui.selectable_value(&mut t.export_doc, DocFilter::Kind(k), k.label());
+                        }
+                    });
+                egui::ComboBox::from_id_salt("export person")
+                    .selected_text(t.export_person.clone().unwrap_or_else(|| "Anyone".into()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut t.export_person, None, "Anyone");
+                        for n in &named {
+                            ui.selectable_value(&mut t.export_person, Some(n.clone()), n);
+                        }
+                    });
+                egui::ComboBox::from_id_salt("export album")
+                    .selected_text(t.export_album.and_then(|i| albums.get(i).cloned()).unwrap_or_else(|| "Any album".into()))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut t.export_album, None, "Any album");
+                        for (i, a) in albums.iter().enumerate() {
+                            ui.selectable_value(&mut t.export_album, Some(i), a);
+                        }
+                    });
+                ui.checkbox(&mut t.export_favorites, "Only favourites");
+            });
+        });
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut t.by_month, true, "Year / month folders");
+            ui.radio_value(&mut t.by_month, false, "All in one folder");
+        });
+
+        let ids = self.export_matches();
+        let bytes: u64 = ids.iter().map(|&i| self.photos[i].size).sum();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("{} item{} match · {}", ids.len(), if ids.len() == 1 { "" } else { "s" }, human_bytes(bytes))).size(16.0).color(TEXT));
+        ui.add_space(8.0);
+        let ok = !ids.is_empty() && self.transfer_job.is_none() && self.transfer.export_filter.date_error().is_none();
+        let b = egui::Button::new(egui::RichText::new(format!("{}  Choose folder and export…", icon::EXPORT)).color(Color32::from_rgb(6, 46, 111)))
+            .fill(ACCENT)
+            .corner_radius(CornerRadius::same(18))
+            .min_size(vec2(240.0, 40.0));
+        if ui.add_enabled(ok, b).clicked() {
+            if let Some(dest) = rfd::FileDialog::new().set_title("Export to").pick_folder() {
+                let items: Vec<transfer::ExportItem> =
+                    ids.iter().map(|&i| transfer::ExportItem { src: self.photos[i].path.clone(), taken: self.photos[i].taken }).collect();
+                let by_month = self.transfer.by_month;
+                self.start_transfer(format!("Exporting to {}", dest.display()), ctx, move |cancel, r| {
+                    transfer::spawn_export(items, dest, by_month, cancel, r)
+                });
+            }
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         let vault_exists = vault::exists();
         let vault_open = self.vault.is_some();
@@ -2481,6 +2939,7 @@ impl eframe::App for PhotosApp {
         self.debug_hooks(ctx);
 
         self.poll_vault(ctx);
+        self.poll_transfer(ctx);
         // Minimising the window locks Locked Folder, like leaving the page does.
         if self.vault.is_some() && self.vault_job.is_none() && ctx.input(|i| i.viewport().minimized == Some(true)) {
             self.lock_vault();
@@ -2525,6 +2984,8 @@ impl eframe::App for PhotosApp {
                         self.albums_page(ui);
                     } else if self.page == Page::People {
                         self.people_page(ui);
+                    } else if self.page == Page::Transfer {
+                        self.transfer_page(ui);
                     } else if self.page == Page::Locked {
                         self.locked_page(ui);
                     } else {
@@ -2533,6 +2994,10 @@ impl eframe::App for PhotosApp {
                 });
         }
         self.dialogs(ctx);
+        // Pages without a photo grid don't call `set_wanted`; still load the sidebar's thumbnails.
+        if !self.sidebar_wanted.is_empty() {
+            self.set_wanted(Vec::new());
+        }
     }
 }
 
@@ -2782,6 +3247,11 @@ impl PhotosApp {
                 Some("people") => self.set_page(Page::People),
                 Some("documents") => self.set_page(Page::Documents),
                 Some("locked") => self.set_page(Page::Locked),
+                Some("import") => self.set_page(Page::Transfer),
+                Some("export") => {
+                    self.transfer.export = true;
+                    self.set_page(Page::Transfer);
+                }
                 Some("receipts") => self.set_page(Page::Doc(DocKind::Receipt)),
                 Some("dogs") => self.set_page(Page::Pets(Pet::Dog)),
                 Some("cats") => self.set_page(Page::Pets(Pet::Cat)),

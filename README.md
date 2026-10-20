@@ -14,6 +14,7 @@ An offline photo library written in Rust, laid out like Google Photos. Open a fo
 - **People & pets**: faces are found and grouped into people, with round avatars. Name a person (giving two groups the same name merges them), hide someone, and search by name. Dogs and cats get their own groups. Everything runs on your computer with three small open models, and nothing is uploaded. Results are cached, so each photo is analysed once.
 - **Documents**: receipts, notes, social media screenshots, recipes & menus, and ID cards are picked out into their own groups, listed in the sidebar like Google Photos. This uses CLIP on your computer.
 - **Locked Folder**: photos you move here are encrypted on this computer, removed from your folders, and hidden from Photos, search, albums and People. They open only with your passphrase (see [Locked Folder security](#locked-folder-security)).
+- **Import & export**: import from **Mac Photos** (PhotoKit, including iCloud-only items), **Google Photos** (sign in and pick), **Google Takeout** zips (dates restored from Takeout's JSON, album duplicates skipped), or any **folder or drive**. Export copies into year/month folders or one folder. Both take filters: date range ("2020", "2020-05", "2020-05-17"), name, photos or videos, and for export also document kind, person, album and favourites. Files already there are skipped.
 - **Search**: by file name, a person's name, a document kind ("receipt", "menu", "passport"), or a date ("2024", "october", "sunday", "2024-10-06").
 - **Viewer**: ← / → to move between photos, F to favourite, Esc to go back.
 - **Videos**: MP4, MOV, M4V, MKV, WebM, AVI, 3GP, MTS, WMV. They get poster-frame thumbnails with a duration badge, a Videos page, and in-app playback with sound: Space to play/pause, a seek bar, mute, and "open in default player". The recording date comes from the file's metadata. Phone videos shot in portrait show upright.
@@ -81,6 +82,18 @@ The app looks for them in a `models` folder next to the binary, `../share/banana
 - **While open:** decrypted photos stay in memory and are never written to disk. Locked Folder locks again when you leave the page or minimise the window, and the key is wiped from memory.
 - **Limits:** no encryption is literally unbreakable. With a long passphrase (four or more random words) guessing it is out of reach; with a short one it is not. There is **no recovery**: forget the passphrase and the photos are gone. On SSDs a deleted original may linger in free space until it is overwritten, which a deleting app can't prevent. For that, also use FileVault (macOS) or full-disk encryption (Linux). Videos are stored encrypted but must be moved out to play.
 
+## Google Photos import
+
+Since March 2025 Google lets apps read only the photos a person picks in Google's own picker (the Photos Picker API). The app opens your browser to sign in, then the picker, then downloads what you chose. It needs an OAuth client from your own Google Cloud project, which is free:
+
+1. console.cloud.google.com → create a project.
+2. APIs & Services → Library → enable **Google Photos Picker API**.
+3. OAuth consent screen → External → add yourself as a test user.
+4. Credentials → Create credentials → OAuth client ID → **Desktop app**.
+5. Paste the client ID and secret into Import & export → Google Photos.
+
+Sign-in uses the installed-app flow with PKCE and a one-off listener on 127.0.0.1. The access token is kept in memory only for that import. To bring over a whole library at once, use Google Takeout instead.
+
 ## Run
 
 ```bash
@@ -97,6 +110,7 @@ With no folder it opens the last folder you used, or your Pictures folder.
 | `src/imageio.rs` | macOS only: HEIC/HEIF/AVIF decoding through the system ImageIO framework |
 | `src/video/` | Video metadata, thumbnails and playback: `mac.rs` (AVFoundation), `gst.rs` (GStreamer), `none.rs` (no backend) |
 | `src/people/` | Face detection, alignment and fingerprints, dog/cat spotting, document kinds (`vision.rs`), the analysis cache and grouping into people (`mod.rs`) |
+| `src/transfer/` | Import & export: filters, export, folder and Takeout import (`mod.rs`), Google Photos Picker sign-in (`google.rs`), Mac Photos via PhotoKit (`macphotos.rs`) |
 | `src/vault.rs` | Locked Folder: Argon2id key, XChaCha20-Poly1305 chunked encryption, verify-then-delete, restore (with tests) |
 | `src/thumbs.rs` | Worker threads that decode thumbnails (visible ones first) and full images, with a disk cache |
 | `src/store.rs` | Albums, favourites and archive, saved as JSON |

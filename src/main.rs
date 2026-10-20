@@ -5,6 +5,7 @@ mod library;
 mod people;
 mod store;
 mod thumbs;
+mod transfer;
 mod vault;
 mod video;
 

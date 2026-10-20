@@ -74,7 +74,7 @@ pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egu
     });
 }
 
-fn read_photo(path: &Path) -> Option<Photo> {
+pub fn read_photo(path: &Path) -> Option<Photo> {
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok()?;
     let mtime = modified.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

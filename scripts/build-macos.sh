@@ -60,6 +60,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSPhotoLibraryUsageDescription</key><string>Banana Photos copies the photos you choose from the Photos app into your library folder.</string>
   <key>NSDesktopFolderUsageDescription</key><string>Banana Photos shows the photos in folders you open.</string>
   <key>NSDocumentsFolderUsageDescription</key><string>Banana Photos shows the photos in folders you open.</string>
   <key>NSDownloadsFolderUsageDescription</key><string>Banana Photos shows the photos in folders you open.</string>
