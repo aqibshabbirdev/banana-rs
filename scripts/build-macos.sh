@@ -5,6 +5,10 @@
 #     (picked up automatically when exactly one Developer ID Application certificate is in the keychain)
 #   NOTARY_PROFILE=notary scripts/build-macos.sh   also notarizes and staples the dmg, so it opens with
 #     no warning on any Mac. Make the profile once: xcrun notarytool store-credentials notary
+#   APPSTORE=1 scripts/build-macos.sh   Mac App Store build instead: sandboxed (macos/sandbox.entitlements),
+#     signed with "Apple Distribution", with the Mac App Store provisioning profile embedded, packed into
+#     dist/BananaPhotos-<version>.pkg for Transporter. BUILD_NUMBER sets CFBundleVersion (must go up with
+#     every upload); APPSTORE_PROFILE picks the .provisionprofile (found automatically otherwise).
 # Needs only Xcode command line tools and Rust; HEIC uses macOS's ImageIO, so nothing to bundle.
 set -euo pipefail
 
@@ -15,6 +19,46 @@ TARGET="aarch64-apple-darwin"
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 DIST="dist"
 APP="$DIST/$APP_NAME.app"
+TEAM_ID="${TEAM_ID:-4KV8W3FP9B}"
+APPSTORE="${APPSTORE:-}"
+BUILD_NUMBER="${BUILD_NUMBER:-$VERSION}"
+
+# The one identity in the keychain whose name starts with $1, if there's exactly one.
+only_identity() {
+  local found
+  found=$(security find-identity -v 2>/dev/null | grep -o "\"$1[^\"]*\"" | tr -d '"' | sort -u || true)
+  if [ -n "$found" ] && [ "$(printf '%s\n' "$found" | wc -l | tr -d ' ')" = 1 ]; then
+    printf '%s' "$found"
+  fi
+}
+
+if [ -n "$APPSTORE" ]; then
+  APP_SIGN_ID="${APP_SIGN_ID:-$(only_identity "Apple Distribution: ")}"
+  APP_SIGN_ID="${APP_SIGN_ID:-$(only_identity "3rd Party Mac Developer Application: ")}"
+  PKG_SIGN_ID="${PKG_SIGN_ID:-$(only_identity "3rd Party Mac Developer Installer: ")}"
+  PKG_SIGN_ID="${PKG_SIGN_ID:-$(only_identity "Mac Installer Distribution: ")}"
+  if [ -z "${APPSTORE_PROFILE:-}" ]; then
+    for f in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/"*.provisionprofile \
+             "$HOME/Library/MobileDevice/Provisioning Profiles/"*.provisionprofile; do
+      [ -f "$f" ] || continue
+      plist=$(security cms -D -i "$f" 2>/dev/null) || continue
+      # A Mac App Store profile for this app: right app id, no device list (that's development).
+      if printf '%s' "$plist" | grep -q "<string>$TEAM_ID.$BUNDLE_ID</string>" &&
+         ! printf '%s' "$plist" | grep -q "ProvisionedDevices"; then
+        APPSTORE_PROFILE="$f"
+      fi
+    done
+  fi
+  missing=""
+  [ -n "$APP_SIGN_ID" ] || missing="$missing\n  - an \"Apple Distribution\" certificate"
+  [ -n "$PKG_SIGN_ID" ] || missing="$missing\n  - a \"Mac Installer Distribution\" certificate"
+  [ -n "${APPSTORE_PROFILE:-}" ] || missing="$missing\n  - a Mac App Store provisioning profile for $TEAM_ID.$BUNDLE_ID"
+  if [ -n "$missing" ]; then
+    printf "APPSTORE=1 needs (create them in Xcode → Settings → Apple Accounts → Manage Certificates,\nand the profile at developer.apple.com → Profiles):$missing\n" >&2
+    exit 1
+  fi
+fi
+
 if [ -z "${SIGN_ID:-}" ]; then
   DEV_IDS=$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | tr -d '"' || true)
   if [ -n "$DEV_IDS" ] && [ "$(printf '%s\n' "$DEV_IDS" | wc -l | tr -d ' ')" = 1 ]; then
@@ -68,7 +112,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
@@ -83,6 +127,24 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+if [ -n "$APPSTORE" ]; then
+  echo "==> Signing for the Mac App Store ($APP_SIGN_ID)"
+  cp "$APPSTORE_PROFILE" "$APP/Contents/embedded.provisionprofile"
+  ENT="$(mktemp -d)/appstore.entitlements"
+  cp macos/sandbox.entitlements "$ENT"
+  /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $TEAM_ID.$BUNDLE_ID" "$ENT"
+  /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $TEAM_ID" "$ENT"
+  codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$APP_SIGN_ID" "$APP"
+  codesign --verify --strict "$APP"
+  PKG="$DIST/BananaPhotos-$VERSION.pkg"
+  echo "==> Making $PKG ($PKG_SIGN_ID)"
+  productbuild --component "$APP" /Applications --sign "$PKG_SIGN_ID" "$PKG"
+  pkgutil --check-signature "$PKG" | head -3
+  echo
+  echo "Done: $PKG (build $BUILD_NUMBER). Upload it with Transporter or: xcrun altool --upload-app -t macos -f \"$PKG\" ..."
+  exit 0
+fi
 
 echo "==> Signing ($SIGN_ID)"
 if [ "$SIGN_ID" = "-" ]; then
