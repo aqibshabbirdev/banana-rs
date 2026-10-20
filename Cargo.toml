@@ -49,3 +49,7 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+
+[dev-dependencies]
+# Only for examples/make_doc_prompts.rs, which precomputes the Documents prompt embeddings.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

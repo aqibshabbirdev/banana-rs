@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Downloads the three small ONNX models People & pets uses into assets/models (or $1),
-# and checks their SHA-256. All three are free for commercial use:
+# Downloads the ONNX models People & pets and Documents use into assets/models (or $1),
+# and checks their SHA-256. All four are free for commercial use:
 #   YuNet face detector   - OpenCV Zoo, MIT
 #   SFace face recognizer - OpenCV Zoo, Apache-2.0
 #   MobileNetV2 (ImageNet)- ONNX Model Zoo, Apache-2.0
+#   CLIP ViT-B/32 image encoder (OpenAI, MIT; int8 export by Xenova) - for Documents
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DEST="${1:-assets/models}"
@@ -37,5 +38,9 @@ fetch face_recognition_sface_2021dec.onnx \
 fetch mobilenetv2-12.onnx \
   https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-12.onnx \
   c0c3f76d93fa3fd6580652a45618618a220fced18babf65774ed169de0432ad5
+
+fetch clip_vision_quantized.onnx \
+  https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/onnx/vision_model_quantized.onnx \
+  583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299
 
 echo "Models are in $DEST"

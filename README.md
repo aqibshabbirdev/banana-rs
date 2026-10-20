@@ -12,7 +12,8 @@ An offline photo library written in Rust, laid out like Google Photos. Open a fo
 - **Favorites, Archive, Screenshots & recordings, Recently added** pages. Archived photos are hidden from Photos.
 - **Selecting photos**: Ctrl/Cmd-click or the circle selects one photo, Shift-click selects a range, clicking a day heading selects the whole day, Ctrl/Cmd+A selects everything, Esc clears.
 - **People & pets**: faces are found and grouped into people, with round avatars. Name a person (giving two groups the same name merges them), hide someone, and search by name. Dogs and cats get their own groups. Everything runs on your computer with three small open models, and nothing is uploaded. Results are cached, so each photo is analysed once.
-- **Search**: by file name, a person's name, or a date ("2024", "october", "sunday", "2024-10-06").
+- **Documents**: receipts, notes, social media screenshots, recipes & menus, and ID cards are picked out into their own groups, listed in the sidebar like Google Photos. This uses CLIP on your computer.
+- **Search**: by file name, a person's name, a document kind ("receipt", "menu", "passport"), or a date ("2024", "october", "sunday", "2024-10-06").
 - **Viewer**: ← / → to move between photos, F to favourite, Esc to go back.
 - **Videos**: MP4, MOV, M4V, MKV, WebM, AVI, 3GP, MTS, WMV. They get poster-frame thumbnails with a duration badge, a Videos page, and in-app playback with sound: Space to play/pause, a seek bar, mute, and "open in default player". The recording date comes from the file's metadata. Phone videos shot in portrait show upright.
 - **Formats**: JPEG, PNG, WebP, GIF, BMP, TIFF, and **HEIC / HEIF / AVIF** (iPhone photos).
@@ -56,15 +57,18 @@ Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folde
 
 The app icon is drawn by `cargo run --release --example make_icon -- assets/icon.png`.
 
-## People & pets models
+## People & pets and Documents models
 
-Face and pet recognition need three ONNX files (about 53 MB in total). `scripts/fetch-models.sh` downloads them into `assets/models` and checks their SHA-256. The macOS and Linux build scripts run it and ship the models with the app.
+Face, pet and document recognition need four ONNX files (about 140 MB in total). `scripts/fetch-models.sh` downloads them into `assets/models` and checks their SHA-256. The macOS and Linux build scripts run it and ship the models with the app.
 
 | Model | Job | License |
 |---|---|---|
 | YuNet (OpenCV Zoo) | finds faces and their landmarks | MIT |
 | SFace (OpenCV Zoo) | face fingerprints for grouping | Apache-2.0 |
 | MobileNetV2 (ONNX Model Zoo) | spots dogs and cats | Apache-2.0 |
+| CLIP ViT-B/32 image encoder (OpenAI, int8 by Xenova) | sorts documents into kinds | MIT |
+
+Documents compares each photo's CLIP embedding with a few phrases per kind. Their text embeddings are precomputed in `src/people/doc_prompts.json` (made by `examples/make_doc_prompts.rs`), so the app doesn't need CLIP's text half. Without the CLIP file, Documents stays empty and People & pets still works.
 
 The app looks for them in a `models` folder next to the binary, `../share/banana-rs/models`, the app bundle's Resources, `~/.local/share/banana-rs/models`, or `$BANANA_MODELS`. Without them, everything else still works, and People & pets explains what's missing. They run with [tract](https://github.com/sonos/tract), a pure-Rust ONNX runtime, so nothing extra needs installing.
 
@@ -83,7 +87,7 @@ With no folder it opens the last folder you used, or your Pictures folder.
 | `src/library.rs` | Walks the folder; reads each photo's date, shape and EXIF rotation |
 | `src/imageio.rs` | macOS only: HEIC/HEIF/AVIF decoding through the system ImageIO framework |
 | `src/video/` | Video metadata, thumbnails and playback: `mac.rs` (AVFoundation), `gst.rs` (GStreamer), `none.rs` (no backend) |
-| `src/people/` | Face detection, alignment and fingerprints, dog/cat spotting (`vision.rs`), the analysis cache and grouping into people (`mod.rs`) |
+| `src/people/` | Face detection, alignment and fingerprints, dog/cat spotting, document kinds (`vision.rs`), the analysis cache and grouping into people (`mod.rs`) |
 | `src/thumbs.rs` | Worker threads that decode thumbnails (visible ones first) and full images, with a disk cache |
 | `src/store.rs` | Albums, favourites and archive, saved as JSON |
 | `src/app.rs` | The egui UI: sidebar, justified timeline, memories, albums, viewer, dialogs |

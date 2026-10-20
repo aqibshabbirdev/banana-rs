@@ -12,7 +12,7 @@ use eframe::egui::{
 use egui_phosphor::regular as icon;
 
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
-use crate::people::{self, FaceRef, Person, Pet};
+use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
 use crate::thumbs::{cache_key, spawn_full, Job, Loaded, ThumbLoader};
 use crate::video;
@@ -50,6 +50,8 @@ enum Page {
     People,
     Person(usize),
     Pets(Pet),
+    Documents,
+    Doc(DocKind),
     Screenshots,
     Recent,
     Archive,
@@ -70,6 +72,8 @@ impl Page {
             Page::People => 7,
             Page::Pets(Pet::Dog) => 8,
             Page::Pets(Pet::Cat) => 9,
+            Page::Documents => 10,
+            Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
             Page::Person(i) => 101 + 2 * i,
         }
@@ -180,8 +184,13 @@ pub struct PhotosApp {
     // People & pets
     people_index: people::Index,
     people: Vec<Person>,
-    /// Lower-case names of the people in each photo, for search.
-    photo_people: HashMap<PathBuf, String>,
+    /// Extra lower-case words per photo for search: people's names, document kinds.
+    photo_tags: HashMap<PathBuf, String>,
+    /// Photos per document kind, newest first (filled when re-grouping).
+    doc_photos: HashMap<DocKind, Vec<usize>>,
+    docs_open: bool,
+    /// Thumbnails the sidebar wants, added to whatever the page asks the loader for.
+    sidebar_wanted: Vec<Job>,
     people_dirty: bool,
     people_index_dirty: bool,
     last_cluster: f64,
@@ -250,7 +259,10 @@ impl PhotosApp {
             albums_open: true,
             people_index: people::Index::load(),
             people: Vec::new(),
-            photo_people: HashMap::new(),
+            photo_tags: HashMap::new(),
+            doc_photos: HashMap::new(),
+            docs_open: true,
+            sidebar_wanted: Vec::new(),
             people_dirty: true,
             people_index_dirty: false,
             last_cluster: 0.0,
@@ -428,9 +440,11 @@ impl PhotosApp {
                     Page::Albums | Page::People => false,
                     Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                     Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
+                    Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
+                    Page::Doc(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc == Some(kind)),
                     Page::Album(_) => album.as_ref().is_some_and(|a| a.contains(&p.path)),
                 };
-                on_page && (terms.is_empty() || matches_search(p, &terms, self.photo_people.get(&p.path).map(String::as_str).unwrap_or("")))
+                on_page && (terms.is_empty() || matches_search(p, &terms, self.photo_tags.get(&p.path).map(String::as_str).unwrap_or("")))
             })
             .collect();
         order.sort_by(|&a, &b| self.when(b).cmp(&self.when(a)).then_with(|| self.photos[a].path.cmp(&self.photos[b].path)));
@@ -751,6 +765,40 @@ impl PhotosApp {
             }
         }
 
+        // Documents: like Albums, the caret folds the kinds; each kind shows its newest photo.
+        let caret = if self.docs_open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
+        let r = nav_item(ui, icon::FILE_TEXT, "Documents", self.page == Page::Documents && !self.docs_open, Some(caret));
+        if r.clicked() {
+            if r.interact_pointer_pos().is_some_and(|p| p.x < r.rect.left() + 26.0) {
+                self.docs_open = !self.docs_open;
+            } else {
+                go = Some(Page::Documents);
+            }
+        }
+        if self.docs_open {
+            for kind in DocKind::ALL {
+                let Some(&cover) = self.doc_photos.get(&kind).and_then(|ids| ids.first()) else { continue };
+                let tex = match self.thumbs.get_mut(&cover) {
+                    Some((t, seen)) => {
+                        *seen = self.frame;
+                        Some(t.clone())
+                    }
+                    None => {
+                        if !self.failed.contains(&cover) {
+                            self.sidebar_wanted.push(make_job(self.gen, cover, &self.photos[cover]));
+                        }
+                        None
+                    }
+                };
+                if thumb_item(ui, tex.as_ref(), None, kind.label(), self.page == Page::Doc(kind)).clicked() {
+                    go = Some(Page::Doc(kind));
+                }
+            }
+            if thumb_item(ui, None, Some(icon::ARROW_RIGHT), "View all documents", self.page == Page::Documents).clicked() {
+                go = Some(Page::Documents);
+            }
+        }
+
         let items = [
             (icon::STAR, "Favorites", Page::Favorites),
             (icon::PLAY_CIRCLE, "Videos", Page::Videos),
@@ -818,6 +866,8 @@ impl PhotosApp {
             }
             Page::Pets(Pet::Dog) => "Dogs",
             Page::Pets(Pet::Cat) => "Cats",
+            Page::Documents => "Documents",
+            Page::Doc(k) => k.label(),
             Page::Favorites => "Favorites",
             Page::Videos => "Videos",
             Page::Screenshots => "Screenshots & recordings",
@@ -874,12 +924,14 @@ impl PhotosApp {
                     Page::Screenshots => "No screenshots or screen recordings found.",
                     Page::Videos => "No videos in this folder.",
                     Page::Person(_) | Page::Pets(_) => "No photos.",
+                    Page::Documents | Page::Doc(_) if self.analysing => "Looking for documents… they appear here as photos are analysed.",
+                    Page::Documents | Page::Doc(_) => "No documents found. Receipts, notes, menus, IDs and social media screenshots show up here.",
                     Page::Archive => "Nothing archived. Archive photos to hide them from Photos.",
                     _ => "This album is empty. Go to Photos, select some, then add them to this album.",
                 }
             };
             ui.centered_and_justified(|ui| ui.label(egui::RichText::new(msg).size(15.0).color(TEXT_DIM)));
-            self.loader.set_wanted(Vec::new());
+            self.set_wanted(Vec::new());
             return;
         }
 
@@ -991,7 +1043,7 @@ impl PhotosApp {
         wanted_soon.reverse();
         wanted_now.reverse();
         wanted_soon.extend(wanted_now);
-        self.loader.set_wanted(wanted_soon);
+        self.set_wanted(wanted_soon);
 
         match click {
             Some(Click::Open(pos)) => self.open_viewer(pos, ui.ctx()),
@@ -1114,7 +1166,7 @@ impl PhotosApp {
             ui.centered_and_justified(|ui| {
                 ui.label(egui::RichText::new("No albums yet. Select photos (Ctrl/Cmd-click), then use + to add them to an album.").color(TEXT_DIM))
             });
-            self.loader.set_wanted(Vec::new());
+            self.set_wanted(Vec::new());
             return;
         }
 
@@ -1163,7 +1215,7 @@ impl PhotosApp {
             });
         });
         wanted.reverse();
-        self.loader.set_wanted(wanted);
+        self.set_wanted(wanted);
         if let Some(i) = open {
             self.set_page(Page::Album(i));
         }
@@ -1380,6 +1432,14 @@ impl PhotosApp {
         });
     }
 
+    /// Hands the thumbnail loader this page's jobs plus the sidebar's (sidebar ones go first,
+    /// which the loader treats as least urgent).
+    fn set_wanted(&mut self, jobs: Vec<Job>) {
+        let mut all = std::mem::take(&mut self.sidebar_wanted);
+        all.extend(jobs);
+        self.loader.set_wanted(all);
+    }
+
     /// Starts finding faces and pets in photos not analysed yet (runs after every scan).
     fn start_analysis(&mut self, ctx: &egui::Context) {
         let Some(models) = people::models_dir() else {
@@ -1449,11 +1509,20 @@ impl PhotosApp {
             &self.store.face_names,
             &self.store.hidden_faces,
         );
-        self.photo_people.clear();
+        self.photo_tags.clear();
+        self.doc_photos.clear();
+        for (path, a) in &self.people_index.entries {
+            let (Some(kind), Some(&id)) = (a.doc, self.path_index.get(path)) else { continue };
+            self.photo_tags.entry(path.clone()).or_default().push_str(kind.keywords());
+            self.doc_photos.entry(kind).or_default().push(id);
+        }
+        for ids in self.doc_photos.values_mut() {
+            ids.sort_by(|&a, &b| self.photos[b].taken.cmp(&self.photos[a].taken));
+        }
         for person in &self.people {
             let Some(name) = &person.name else { continue };
             for photo in &person.photos {
-                let names = self.photo_people.entry(photo.clone()).or_default();
+                let names = self.photo_tags.entry(photo.clone()).or_default();
                 names.push(' ');
                 names.push_str(&name.to_lowercase());
             }
@@ -1635,7 +1704,7 @@ impl PhotosApp {
                 }
             }
         });
-        self.loader.set_wanted(wanted);
+        self.set_wanted(wanted);
         if let Some(p) = go {
             self.set_page(p);
         }
@@ -1919,6 +1988,34 @@ fn nav_item(ui: &mut egui::Ui, ic: &str, label: &str, selected: bool, caret: Opt
     resp
 }
 
+/// Sidebar sub-row with a small square photo (or an icon) where the nav icons sit.
+fn thumb_item(ui: &mut egui::Ui, tex: Option<&TextureHandle>, ic: Option<&str>, label: &str, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, CornerRadius::same(22), PILL_BG);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(22), HOVER_BG);
+    }
+    let color = if selected { PILL_TEXT } else { TEXT };
+    let thumb = Rect::from_center_size(pos2(rect.left() + 40.0, rect.center().y), vec2(30.0, 30.0));
+    match (tex, ic) {
+        (Some(t), _) => egui::Image::from_texture(t)
+            .uv(fill_uv(t.size_vec2(), thumb.size()))
+            .corner_radius(CornerRadius::same(6))
+            .paint_at(ui, thumb),
+        (None, Some(ic)) => {
+            painter.text(thumb.center(), Align2::CENTER_CENTER, ic, FontId::proportional(20.0), color);
+        }
+        (None, None) => {
+            painter.rect_filled(thumb, CornerRadius::same(6), FIELD_BG);
+        }
+    }
+    let clip = painter.with_clip_rect(rect.shrink2(vec2(8.0, 0.0)));
+    clip.text(pos2(rect.left() + 70.0, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(15.0), color);
+    resp
+}
+
 /// Album entry nested under "Albums" in the sidebar.
 fn sub_item(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
@@ -2084,6 +2181,8 @@ impl PhotosApp {
                 Some("favorites") => self.set_page(Page::Favorites),
                 Some("videos") => self.set_page(Page::Videos),
                 Some("people") => self.set_page(Page::People),
+                Some("documents") => self.set_page(Page::Documents),
+                Some("receipts") => self.set_page(Page::Doc(DocKind::Receipt)),
                 Some("dogs") => self.set_page(Page::Pets(Pet::Dog)),
                 Some("cats") => self.set_page(Page::Pets(Pet::Cat)),
                 Some(p) if p.starts_with("person") => self.set_page(Page::Person(p[6..].parse().unwrap_or(0))),

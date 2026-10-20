@@ -8,11 +8,13 @@ use std::path::Path;
 use image::{imageops::FilterType, RgbImage};
 use tract_onnx::prelude::*;
 
-use super::Pet;
+use super::{DocKind, Pet};
 
 pub const DETECTOR: &str = "face_detection_yunet_2023mar.onnx";
 pub const RECOGNIZER: &str = "face_recognition_sface_2021dec.onnx";
 pub const CLASSIFIER: &str = "mobilenetv2-12.onnx";
+/// Image half of OpenAI CLIP ViT-B/32 (MIT), int8-quantised by Xenova. Optional.
+pub const CLIP: &str = "clip_vision_quantized.onnx";
 
 type Plan = Arc<TypedRunnableModel>;
 
@@ -20,6 +22,8 @@ pub struct Models {
     detector: Plan,
     recognizer: Plan,
     classifier: Plan,
+    /// Missing when the CLIP file isn't installed; Documents then stays empty.
+    clip: Option<Plan>,
 }
 
 /// A face found in an image, in that image's pixel coordinates.
@@ -44,12 +48,60 @@ fn load(dir: &Path, name: &str, shape: [usize; 4]) -> TractResult<Plan> {
         .into_runnable()
 }
 
+/// The quantised CLIP export carries symbolic shapes that clash with a fixed batch of 1, so
+/// tract is told to infer shapes itself.
+fn load_clip(dir: &Path) -> TractResult<Plan> {
+    tract_onnx::onnx()
+        .with_ignore_output_shapes(true)
+        .with_ignore_value_info(true)
+        .model_for_path(dir.join(CLIP))?
+        .with_input_fact(0, f32::fact([1, 3, 224, 224]).into())?
+        .into_optimized()?
+        .into_runnable()
+}
+
+/// Precomputed CLIP text embeddings of a few phrases per Documents category, plus everyday
+/// scenes a photo has to beat (made by examples/make_doc_prompts.rs).
+fn doc_prompts() -> &'static [(Option<DocKind>, Vec<f32>)] {
+    static PROMPTS: std::sync::OnceLock<Vec<(Option<DocKind>, Vec<f32>)>> = std::sync::OnceLock::new();
+    PROMPTS.get_or_init(|| {
+        #[derive(serde::Deserialize)]
+        struct P {
+            category: Option<String>,
+            embedding: Vec<f32>,
+        }
+        let raw: Vec<P> = serde_json::from_str(include_str!("doc_prompts.json")).expect("doc_prompts.json");
+        raw.into_iter()
+            .map(|p| {
+                let kind = match p.category.as_deref() {
+                    Some("receipt") => Some(DocKind::Receipt),
+                    Some("notes") => Some(DocKind::Notes),
+                    Some("social") => Some(DocKind::Social),
+                    Some("recipe") => Some(DocKind::Recipe),
+                    Some("identity") => Some(DocKind::Identity),
+                    _ => None,
+                };
+                (kind, p.embedding)
+            })
+            .collect()
+    })
+}
+
+/// Short side to `short`, centre crop to 224×224.
+fn center_crop(img: &RgbImage, short: f32, filter: FilterType) -> RgbImage {
+    let s = short / img.width().min(img.height()) as f32;
+    let (w, h) = (((img.width() as f32 * s).round() as u32).max(224), ((img.height() as f32 * s).round() as u32).max(224));
+    let r = image::imageops::resize(img, w, h, filter);
+    image::imageops::crop_imm(&r, (w - 224) / 2, (h - 224) / 2, 224, 224).to_image()
+}
+
 impl Models {
     pub fn load(dir: &Path) -> TractResult<Self> {
         Ok(Self {
             detector: load(dir, DETECTOR, [1, 3, DET_SIZE, DET_SIZE])?,
             recognizer: load(dir, RECOGNIZER, [1, 3, 112, 112])?,
             classifier: load(dir, CLASSIFIER, [1, 3, 224, 224])?,
+            clip: dir.join(CLIP).is_file().then(|| load_clip(dir)).transpose()?,
         })
     }
 
@@ -117,14 +169,11 @@ impl Models {
     /// Dog, cat or neither, from ImageNet's dog breeds (151-268) and domestic cats (281-285).
     pub fn pet(&self, img: &RgbImage) -> TractResult<Option<Pet>> {
         // Resize the short side to 256, centre-crop 224, normalise like torchvision.
-        let s = 256.0 / img.width().min(img.height()) as f32;
-        let (w, h) = ((img.width() as f32 * s).round() as u32, (img.height() as f32 * s).round() as u32);
-        let r = image::imageops::resize(img, w.max(224), h.max(224), FilterType::Triangle);
-        let (ox, oy) = ((r.width() - 224) / 2, (r.height() - 224) / 2);
+        let r = center_crop(img, 256.0, FilterType::Triangle);
         const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
         const STD: [f32; 3] = [0.229, 0.224, 0.225];
         let input = tract_ndarray::Array4::from_shape_fn((1, 3, 224, 224), |(_, c, y, x)| {
-            (r.get_pixel(ox + x as u32, oy + y as u32)[c] as f32 / 255.0 - MEAN[c]) / STD[c]
+            (r.get_pixel(x as u32, y as u32)[c] as f32 / 255.0 - MEAN[c]) / STD[c]
         });
         let out = self.classifier.run(tvec!(Tensor::from(input).into()))?;
         let logits = out[0].try_as_plain_ram()?.as_slice::<f32>()?;
@@ -140,6 +189,38 @@ impl Models {
         } else {
             None
         })
+    }
+}
+
+impl Models {
+    /// Which kind of document the photo is, if any: CLIP compares the picture with each prompt,
+    /// and a category wins when its prompts take over half of the softmax.
+    pub fn document(&self, img: &RgbImage) -> TractResult<Option<DocKind>> {
+        let Some(clip) = &self.clip else { return Ok(None) };
+        let r = center_crop(img, 224.0, FilterType::CatmullRom);
+        const MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+        const STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
+        let input = tract_ndarray::Array4::from_shape_fn((1, 3, 224, 224), |(_, c, y, x)| {
+            (r.get_pixel(x as u32, y as u32)[c] as f32 / 255.0 - MEAN[c]) / STD[c]
+        });
+        let out = clip.run(tvec!(Tensor::from(input).into()))?;
+        let emb = out[0].try_as_plain_ram()?.as_slice::<f32>()?;
+        let norm = emb.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+
+        let prompts = doc_prompts();
+        // CLIP's learned temperature is 100.
+        let logits: Vec<f32> = prompts.iter().map(|(_, p)| 100.0 * p.iter().zip(emb).map(|(a, b)| a * b).sum::<f32>() / norm).collect();
+        let max = logits.iter().cloned().fold(f32::MIN, f32::max);
+        let exp: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+        let total: f32 = exp.iter().sum();
+        let mut best = (None, 0.0f32);
+        for kind in [DocKind::Receipt, DocKind::Notes, DocKind::Social, DocKind::Recipe, DocKind::Identity] {
+            let p: f32 = prompts.iter().zip(&exp).filter(|((k, _), _)| *k == Some(kind)).map(|(_, e)| e).sum::<f32>() / total;
+            if p > best.1 {
+                best = (Some(kind), p);
+            }
+        }
+        Ok(if best.1 >= 0.5 { best.0 } else { None })
     }
 }
 

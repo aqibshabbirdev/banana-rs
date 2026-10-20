@@ -32,6 +32,41 @@ pub enum Pet {
     Cat,
 }
 
+/// Google Photos-style document groups.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DocKind {
+    Receipt,
+    Notes,
+    Social,
+    Recipe,
+    Identity,
+}
+
+impl DocKind {
+    pub const ALL: [DocKind; 5] = [DocKind::Receipt, DocKind::Notes, DocKind::Social, DocKind::Recipe, DocKind::Identity];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DocKind::Receipt => "Receipts",
+            DocKind::Notes => "Notes",
+            DocKind::Social => "Social",
+            DocKind::Recipe => "Recipes & menus",
+            DocKind::Identity => "Identity",
+        }
+    }
+
+    /// Extra words a search can match.
+    pub fn keywords(self) -> &'static str {
+        match self {
+            DocKind::Receipt => "document receipt receipts bill invoice",
+            DocKind::Notes => "document notes note handwriting whiteboard",
+            DocKind::Social => "document social post meme chat",
+            DocKind::Recipe => "document recipe recipes menu menus",
+            DocKind::Identity => "document identity id card passport license licence",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Face {
     /// x, y, w, h as fractions of the photo.
@@ -46,7 +81,15 @@ pub struct Analysis {
     pub size: u64,
     pub faces: Vec<Face>,
     pub pet: Option<Pet>,
+    #[serde(default)]
+    pub doc: Option<DocKind>,
+    /// Bumped when analysis gains a new kind of result, so older entries are redone.
+    #[serde(default)]
+    pub version: u32,
 }
+
+/// 2 added Documents.
+pub const ANALYSIS_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Index {
@@ -79,7 +122,7 @@ impl Index {
 
     /// True when the photo was analysed and hasn't changed since.
     pub fn is_current(&self, path: &Path, mtime: u64, size: u64) -> bool {
-        self.entries.get(path).is_some_and(|a| a.mtime == mtime && a.size == size)
+        self.entries.get(path).is_some_and(|a| a.mtime == mtime && a.size == size && a.version >= ANALYSIS_VERSION)
     }
 }
 
@@ -169,7 +212,14 @@ pub fn spawn(jobs: Vec<Job>, gen: u64, current: Arc<AtomicU64>, models: PathBuf,
                 if current.load(Ordering::Relaxed) != gen {
                     return;
                 }
-                let analysis = analyse(&models, job).unwrap_or(Analysis { mtime: job.mtime, size: job.size, faces: Vec::new(), pet: None });
+                let analysis = analyse(&models, job).unwrap_or(Analysis {
+                    mtime: job.mtime,
+                    size: job.size,
+                    faces: Vec::new(),
+                    pet: None,
+                    doc: None,
+                    version: ANALYSIS_VERSION,
+                });
                 let _ = tx.send(Msg::Analysed { gen, path: job.path.clone(), analysis });
                 ctx.request_repaint();
             });
@@ -191,7 +241,8 @@ fn analyse(models: &vision::Models, job: &Job) -> Option<Analysis> {
         save_crop(&img, &det, crop_path(&job.path, job.mtime, job.size, faces.len()));
         faces.push(Face { bbox: [det.x / iw, det.y / ih, det.w / iw, det.h / ih], score: det.score, embedding });
     }
-    Some(Analysis { mtime: job.mtime, size: job.size, faces, pet })
+    let doc = models.document(&img).ok().flatten();
+    Some(Analysis { mtime: job.mtime, size: job.size, faces, pet, doc, version: ANALYSIS_VERSION })
 }
 
 /// Square crop around the face with some margin, for the round avatar.
