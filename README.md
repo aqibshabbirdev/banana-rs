@@ -36,7 +36,19 @@ On an older distro whose libheif is too old (e.g. Ubuntu 22.04), build without H
 cargo build --release --no-default-features
 ```
 
-macOS: `brew install libheif pkgconf`, then `cargo build --release`.
+## Mac (Apple Silicon, M1–M4)
+
+```bash
+scripts/build-macos.sh
+```
+
+This builds `dist/Banana Photos.app` and `dist/BananaPhotos-<version>-arm64.dmg` (about 6 MB). It needs only Xcode command line tools and Rust. HEIC uses macOS's own ImageIO, so there is no libheif or Homebrew dependency. Open the dmg and drag the app to Applications. It runs on macOS 11 (Big Sur) or newer.
+
+The app is ad-hoc signed. On another Mac, the first launch needs right-click → **Open** (or `xattr -cr "/Applications/Banana Photos.app"`). To skip that, sign and notarize it with an Apple Developer ID: `SIGN_ID="Developer ID Application: …" scripts/build-macos.sh`, then `xcrun notarytool submit`.
+
+Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folder, and inside an Apple Photos library (`*.photoslibrary`) only the original photos are read, not its thumbnails.
+
+The app icon is drawn by `cargo run --release --example make_icon -- assets/icon.png`.
 
 ## Run
 
@@ -51,6 +63,7 @@ With no folder it opens the last folder you used, or your Pictures folder.
 | File | What it does |
 |---|---|
 | `src/library.rs` | Walks the folder; reads each photo's date, shape and EXIF rotation |
+| `src/imageio.rs` | macOS only: HEIC/HEIF/AVIF decoding through the system ImageIO framework |
 | `src/thumbs.rs` | Worker threads that decode thumbnails (visible ones first) and full images, with a disk cache |
 | `src/store.rs` | Albums, favourites and archive, saved as JSON |
 | `src/app.rs` | The egui UI: sidebar, justified timeline, memories, albums, viewer, dialogs |

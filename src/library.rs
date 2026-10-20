@@ -11,9 +11,9 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 const EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
-#[cfg(feature = "heic")]
+#[cfg(any(target_os = "macos", feature = "heic"))]
 const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "hif", "avif"];
-#[cfg(not(feature = "heic"))]
+#[cfg(not(any(target_os = "macos", feature = "heic")))]
 const HEIF_EXTENSIONS: &[&str] = &[];
 
 pub struct Photo {
@@ -51,7 +51,7 @@ pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egu
         let paths: Vec<PathBuf> = WalkDir::new(&root)
             .follow_links(true)
             .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+            .filter_entry(|e| e.depth() == 0 || wanted_entry(e))
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file() && is_image(e.path()))
             .map(|e| e.into_path())
@@ -83,22 +83,42 @@ fn read_photo(path: &Path) -> Option<Photo> {
         None => (added, false),
     };
 
-    let aspect = image::ImageReader::open(path)
-        .ok()
-        .and_then(|r| r.with_guessed_format().ok())
-        .and_then(|r| r.into_dimensions().ok())
+    let aspect = display_size(path, exif.as_ref())
         .filter(|(w, h)| *w > 0 && *h > 0)
-        .map(|(w, h)| {
-            // libheif already applies HEIF rotation; for everything else EXIF 5-8 means rotated 90°.
-            let rotated = !is_heif(path) && exif.as_ref().and_then(exif_orientation).is_some_and(|o| o >= 5);
-            if rotated { h as f32 / w as f32 } else { w as f32 / h as f32 }
-        })
+        .map(|(w, h)| w as f32 / h as f32)
         .unwrap_or(1.0);
 
     Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect })
 }
 
-fn is_heif(path: &Path) -> bool {
+/// Width and height the way the photo is shown, i.e. after rotation. Reads headers only.
+fn display_size(path: &Path, exif: Option<&exif::Exif>) -> Option<(u32, u32)> {
+    #[cfg(target_os = "macos")]
+    if is_heif(path) {
+        return crate::imageio::dimensions(path);
+    }
+    let (w, h) = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()?;
+    // libheif already applies HEIF rotation; for everything else EXIF 5-8 means rotated 90°.
+    let rotated = !is_heif(path) && exif.and_then(exif_orientation).is_some_and(|o| o >= 5);
+    Some(if rotated { (h, w) } else { (w, h) })
+}
+
+/// Skips hidden files and folders. Inside an Apple Photos library only the original photos
+/// are read; its thumbnails and edited copies would otherwise show up as duplicates.
+fn wanted_entry(e: &walkdir::DirEntry) -> bool {
+    let name = e.file_name().to_string_lossy();
+    if name.starts_with('.') {
+        return false;
+    }
+    let in_photos_library = e
+        .path()
+        .parent()
+        .and_then(|p| p.extension())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("photoslibrary"));
+    !in_photos_library || name == "originals" || name == "Masters"
+}
+
+pub fn is_heif(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| ["heic", "heif", "hif", "avif"].contains(&e.to_ascii_lowercase().as_str()))

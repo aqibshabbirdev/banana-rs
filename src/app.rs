@@ -1282,7 +1282,18 @@ impl PhotosApp {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() || ctx.memory(|m| m.focused().is_some()) {
+        if self.dialog.is_some() {
+            return;
+        }
+        // Trackpad pinch (or Ctrl/Cmd + scroll) resizes the photos, like Photos.app.
+        let (zoom, open) = ctx.input(|i| (i.zoom_delta(), i.modifiers.command && i.key_pressed(Key::O)));
+        if zoom != 1.0 {
+            self.row_height = (self.row_height * zoom).clamp(120.0, 360.0);
+        }
+        if open {
+            self.pick_folder(ctx);
+        }
+        if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
         let (esc, all) = ctx.input(|i| (i.key_pressed(Key::Escape), i.modifiers.command && i.key_pressed(Key::A)));

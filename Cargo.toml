@@ -16,8 +16,10 @@ dirs = "6"
 egui-phosphor = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# HEIC/HEIF/AVIF via the system libheif (Linux: libheif-dev >= 1.17, macOS: brew install libheif).
-# Build without it: cargo build --no-default-features
+
+# HEIC/HEIF/AVIF: macOS uses the built-in ImageIO framework; elsewhere the system libheif
+# (Linux: libheif-dev >= 1.17). Build without it: cargo build --no-default-features
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 libheif-rs = { version = "3", default-features = false, features = ["v1_17", "image"], optional = true }
 
 [features]

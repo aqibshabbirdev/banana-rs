@@ -92,13 +92,7 @@ impl ThumbLoader {
 
 pub fn spawn_full(path: PathBuf, gen: u64, id: usize, tx: Sender<Loaded>, ctx: egui::Context) {
     std::thread::spawn(move || {
-        let image = decode(&path).map(|img| {
-            if img.width() > FULL_MAX || img.height() > FULL_MAX {
-                img.resize(FULL_MAX, FULL_MAX, image::imageops::FilterType::Triangle)
-            } else {
-                img
-            }
-        });
+        let image = decode(&path, FULL_MAX);
         let _ = tx.send(Loaded { gen, id, image: image.map(to_color_image) });
         ctx.request_repaint();
     });
@@ -123,13 +117,31 @@ fn load_thumb(path: &Path, cached: &Path) -> Option<ColorImage> {
     if let Ok(img) = image::open(cached) {
         return Some(to_color_image(img));
     }
-    let thumb = decode(path)?.thumbnail(THUMB_SIZE, THUMB_SIZE);
+    let thumb = decode(path, THUMB_SIZE)?;
     let _ = thumb.to_rgb8().save_with_format(cached, image::ImageFormat::Jpeg);
     Some(to_color_image(thumb))
 }
 
-/// Decodes and applies the EXIF rotation, so phone photos are not shown sideways.
-fn decode(path: &Path) -> Option<DynamicImage> {
+/// Decodes upright (EXIF rotation applied, so phone photos are not sideways) and no bigger
+/// than `max_side` on its longest edge.
+fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
+    #[cfg(target_os = "macos")]
+    if crate::library::is_heif(path) {
+        return crate::imageio::decode(path, max_side);
+    }
+    let img = decode_any(path)?;
+    Some(if img.width() > max_side || img.height() > max_side {
+        if max_side <= THUMB_SIZE {
+            img.thumbnail(max_side, max_side)
+        } else {
+            img.resize(max_side, max_side, image::imageops::FilterType::Triangle)
+        }
+    } else {
+        img
+    })
+}
+
+fn decode_any(path: &Path) -> Option<DynamicImage> {
     use image::ImageDecoder;
     let mut decoder = ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;
     let orientation = decoder.orientation().ok();

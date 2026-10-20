@@ -1,4 +1,6 @@
 mod app;
+#[cfg(target_os = "macos")]
+mod imageio;
 mod library;
 mod store;
 mod thumbs;
@@ -6,8 +8,8 @@ mod thumbs;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
-    // Teaches the `image` crate to open HEIC/HEIF/AVIF, so the rest of the app needs no changes.
-    #[cfg(feature = "heic")]
+    // Teaches the `image` crate to open HEIC/HEIF/AVIF. (macOS uses ImageIO instead, see imageio.rs.)
+    #[cfg(all(feature = "heic", not(target_os = "macos")))]
     libheif_rs::integration::image::register_all_decoding_hooks();
 
     // `banana-rs ~/Pictures` opens that folder; otherwise the last folder, then the Pictures folder.
