@@ -24,6 +24,9 @@ if [ ! -f assets/icon.png ]; then
   cargo run --release --example make_icon -- assets/icon.png
 fi
 
+echo "==> Fetching People & pets models"
+scripts/fetch-models.sh assets/models
+
 echo "==> Making icon"
 ICONSET="$(mktemp -d)/AppIcon.iconset"
 mkdir -p "$ICONSET"
@@ -37,6 +40,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "target/$TARGET/release/banana-rs" "$APP/Contents/MacOS/banana-rs"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+cp -R assets/models "$APP/Contents/Resources/models"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

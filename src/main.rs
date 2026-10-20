@@ -2,6 +2,7 @@ mod app;
 #[cfg(target_os = "macos")]
 mod imageio;
 mod library;
+mod people;
 mod store;
 mod thumbs;
 mod video;

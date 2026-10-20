@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{
@@ -10,6 +12,7 @@ use eframe::egui::{
 use egui_phosphor::regular as icon;
 
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
+use crate::people::{self, FaceRef, Person, Pet};
 use crate::store::Store;
 use crate::thumbs::{cache_key, spawn_full, Job, Loaded, ThumbLoader};
 use crate::video;
@@ -44,6 +47,9 @@ enum Page {
     Photos,
     Favorites,
     Videos,
+    People,
+    Person(usize),
+    Pets(Pet),
     Screenshots,
     Recent,
     Archive,
@@ -61,7 +67,11 @@ impl Page {
             Page::Archive => 4,
             Page::Albums => 5,
             Page::Videos => 6,
-            Page::Album(i) => 7 + i,
+            Page::People => 7,
+            Page::Pets(Pet::Dog) => 8,
+            Page::Pets(Pet::Cat) => 9,
+            Page::Album(i) => 100 + 2 * i,
+            Page::Person(i) => 101 + 2 * i,
         }
     }
 }
@@ -71,6 +81,8 @@ enum Dialog {
     NewAlbum { name: String, photos: Vec<PathBuf> },
     Rename { album: usize, name: String },
     DeleteAlbum(usize),
+    /// Name (or rename) a person; an empty name removes it.
+    NamePerson { person: usize, name: String },
 }
 
 enum Click {
@@ -165,6 +177,26 @@ pub struct PhotosApp {
     dialog: Option<Dialog>,
     albums_open: bool,
 
+    // People & pets
+    people_index: people::Index,
+    people: Vec<Person>,
+    /// Lower-case names of the people in each photo, for search.
+    photo_people: HashMap<PathBuf, String>,
+    people_dirty: bool,
+    people_index_dirty: bool,
+    last_cluster: f64,
+    last_index_save: f64,
+    analysing: bool,
+    analysed: usize,
+    analyse_total: usize,
+    analysis_gen: Arc<AtomicU64>,
+    analysis_rx: Receiver<people::Msg>,
+    analysis_tx: Sender<people::Msg>,
+    /// Why People & pets can't run (models missing, failed to load).
+    people_problem: Option<String>,
+    avatars: HashMap<String, Option<TextureHandle>>,
+    show_hidden_people: bool,
+
     scan_rx: Receiver<ScanMsg>,
     scan_tx: Sender<ScanMsg>,
     scan_total: usize,
@@ -185,6 +217,8 @@ pub struct PhotosApp {
     debug_done: bool,
     #[cfg(debug_assertions)]
     debug_shot_sent: bool,
+    #[cfg(debug_assertions)]
+    debug_done_at: f64,
 }
 
 impl PhotosApp {
@@ -192,6 +226,7 @@ impl PhotosApp {
         setup_style(&cc.egui_ctx);
         let (scan_tx, scan_rx) = channel();
         let (full_tx, full_rx) = channel();
+        let (analysis_tx, analysis_rx) = channel();
         let mut app = Self {
             root: None,
             gen: 0,
@@ -213,6 +248,22 @@ impl PhotosApp {
             store: Store::load(),
             dialog: None,
             albums_open: true,
+            people_index: people::Index::load(),
+            people: Vec::new(),
+            photo_people: HashMap::new(),
+            people_dirty: true,
+            people_index_dirty: false,
+            last_cluster: 0.0,
+            last_index_save: 0.0,
+            analysing: false,
+            analysed: 0,
+            analyse_total: 0,
+            analysis_gen: Arc::new(AtomicU64::new(0)),
+            analysis_rx,
+            analysis_tx,
+            people_problem: None,
+            avatars: HashMap::new(),
+            show_hidden_people: false,
             scan_rx,
             scan_tx,
             scan_total: 0,
@@ -229,6 +280,8 @@ impl PhotosApp {
             debug_done: false,
             #[cfg(debug_assertions)]
             debug_shot_sent: false,
+            #[cfg(debug_assertions)]
+            debug_done_at: 0.0,
         };
         if let Some(dir) = start.or_else(load_last_folder).or_else(dirs::picture_dir) {
             app.open_folder(dir, &cc.egui_ctx);
@@ -253,6 +306,10 @@ impl PhotosApp {
         self.scanning = true;
         self.view_dirty = true;
         save_last_folder(&dir);
+        self.analysis_gen.store(self.gen, Ordering::Relaxed);
+        self.analysing = false;
+        self.people.clear();
+        self.people_dirty = true;
         spawn_scan(dir.clone(), self.gen, self.scan_tx.clone(), ctx.clone());
         self.root = Some(dir);
     }
@@ -286,6 +343,7 @@ impl PhotosApp {
                 ScanMsg::Done(g) if g == self.gen => {
                     self.scanning = false;
                     self.dirty = true;
+                    self.start_analysis(ctx);
                 }
                 _ => {}
             }
@@ -300,6 +358,7 @@ impl PhotosApp {
             self.view_dirty = true;
             self.last_rebuild = now;
         }
+        self.poll_people(now);
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -366,10 +425,12 @@ impl PhotosApp {
                     Page::Videos => !archived && p.is_video,
                     Page::Screenshots => !archived && is_screenshot(&p.path),
                     Page::Archive => archived,
-                    Page::Albums => false,
+                    Page::Albums | Page::People => false,
+                    Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
+                    Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                     Page::Album(_) => album.as_ref().is_some_and(|a| a.contains(&p.path)),
                 };
-                on_page && (terms.is_empty() || matches_search(p, &terms))
+                on_page && (terms.is_empty() || matches_search(p, &terms, self.photo_people.get(&p.path).map(String::as_str).unwrap_or("")))
             })
             .collect();
         order.sort_by(|&a, &b| self.when(b).cmp(&self.when(a)).then_with(|| self.photos[a].path.cmp(&self.photos[b].path)));
@@ -693,12 +754,14 @@ impl PhotosApp {
         let items = [
             (icon::STAR, "Favorites", Page::Favorites),
             (icon::PLAY_CIRCLE, "Videos", Page::Videos),
+            (icon::USERS_THREE, "People & pets", Page::People),
             (icon::DEVICE_MOBILE, "Screenshots & recordings", Page::Screenshots),
             (icon::CLOCK, "Recently added", Page::Recent),
             (icon::ARCHIVE, "Archive", Page::Archive),
         ];
         for (ic, label, page) in items {
-            if nav_item(ui, ic, label, self.page == page, None).clicked() {
+            let on = self.page == page || (page == Page::People && matches!(self.page, Page::Person(_) | Page::Pets(_)));
+            if nav_item(ui, ic, label, on, None).clicked() {
                 go = Some(page);
             }
         }
@@ -748,7 +811,13 @@ impl PhotosApp {
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
         let title = match self.page {
-            Page::Photos | Page::Albums => return,
+            Page::Photos | Page::Albums | Page::People => return,
+            Page::Person(i) => {
+                self.person_header(ui, i);
+                return;
+            }
+            Page::Pets(Pet::Dog) => "Dogs",
+            Page::Pets(Pet::Cat) => "Cats",
             Page::Favorites => "Favorites",
             Page::Videos => "Videos",
             Page::Screenshots => "Screenshots & recordings",
@@ -804,6 +873,7 @@ impl PhotosApp {
                     Page::Favorites => "No favorites yet. Select photos and tap the heart, or press F in the viewer.",
                     Page::Screenshots => "No screenshots or screen recordings found.",
                     Page::Videos => "No videos in this folder.",
+                    Page::Person(_) | Page::Pets(_) => "No photos.",
                     Page::Archive => "Nothing archived. Archive photos to hide them from Photos.",
                     _ => "This album is empty. Go to Photos, select some, then add them to this album.",
                 }
@@ -1310,6 +1380,319 @@ impl PhotosApp {
         });
     }
 
+    /// Starts finding faces and pets in photos not analysed yet (runs after every scan).
+    fn start_analysis(&mut self, ctx: &egui::Context) {
+        let Some(models) = people::models_dir() else {
+            self.people_problem = Some(
+                "Face recognition models aren't installed. Run scripts/fetch-models.sh, or put the three .onnx files in a \"models\" folder next to the app.".into(),
+            );
+            return;
+        };
+        self.people_problem = None;
+        let jobs: Vec<people::Job> = self
+            .photos
+            .iter()
+            .filter(|p| !p.is_video && !self.people_index.is_current(&p.path, p.mtime, p.size))
+            .map(|p| people::Job { path: p.path.clone(), mtime: p.mtime, size: p.size })
+            .collect();
+        self.analysed = 0;
+        self.analyse_total = jobs.len();
+        self.people_dirty = true;
+        self.analysing = !jobs.is_empty();
+        if self.analysing {
+            people::spawn(jobs, self.gen, self.analysis_gen.clone(), models, self.analysis_tx.clone(), ctx.clone());
+        }
+    }
+
+    fn poll_people(&mut self, now: f64) {
+        while let Ok(msg) = self.analysis_rx.try_recv() {
+            match msg {
+                people::Msg::Analysed { gen, path, analysis } if gen == self.gen => {
+                    self.people_index.entries.insert(path, analysis);
+                    self.analysed += 1;
+                    self.people_dirty = true;
+                    self.people_index_dirty = true;
+                }
+                people::Msg::Finished { gen } if gen == self.gen => {
+                    self.analysing = false;
+                    self.people_dirty = true;
+                }
+                people::Msg::Failed { gen, error } if gen == self.gen => {
+                    self.analysing = false;
+                    self.people_problem = Some(format!("Couldn't load the face models: {error}"));
+                }
+                _ => {}
+            }
+        }
+        if self.people_index_dirty && (!self.analysing || now - self.last_index_save > 10.0) {
+            self.people_index.save();
+            self.people_index_dirty = false;
+            self.last_index_save = now;
+        }
+        // Grouping is quick but not free, so while analysis runs it happens every few seconds.
+        if self.people_dirty && !self.scanning && (!self.analysing || now - self.last_cluster > 3.0) {
+            self.last_cluster = now;
+            self.recluster();
+        }
+    }
+
+    /// Re-groups faces into people, keeping an open person open by following its cover face.
+    fn recluster(&mut self) {
+        self.people_dirty = false;
+        let open = match self.page {
+            Page::Person(i) => self.people.get(i).map(|p| p.cover.clone()),
+            _ => None,
+        };
+        self.people = people::cluster(
+            &self.people_index,
+            |p| self.path_index.contains_key(p),
+            &self.store.face_names,
+            &self.store.hidden_faces,
+        );
+        self.photo_people.clear();
+        for person in &self.people {
+            let Some(name) = &person.name else { continue };
+            for photo in &person.photos {
+                let names = self.photo_people.entry(photo.clone()).or_default();
+                names.push(' ');
+                names.push_str(&name.to_lowercase());
+            }
+        }
+        if let Page::Person(_) = self.page {
+            match open.and_then(|c| self.people.iter().position(|p| p.faces.contains(&c))) {
+                Some(i) => self.page = Page::Person(i),
+                None => self.page = Page::People,
+            }
+        }
+        self.view_dirty = true;
+    }
+
+    /// The round avatar picture of a face, loading at most `budget` new ones per frame.
+    fn face_texture(&mut self, ctx: &egui::Context, face: &FaceRef, budget: &mut usize) -> Option<TextureHandle> {
+        let key = face.key();
+        if let Some(t) = self.avatars.get(&key) {
+            return t.clone();
+        }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let a = self.people_index.entries.get(&face.path)?;
+        let tex = people::crop_path(&face.path, a.mtime, a.size, face.index)
+            .and_then(|p| image::open(p).ok())
+            .map(|img| {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                ctx.load_texture(format!("face {key}"), egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), TextureOptions::LINEAR)
+            });
+        self.avatars.insert(key, tex.clone());
+        tex
+    }
+
+    /// Photos of one kind of pet in the open folder, newest first.
+    fn pet_photos(&self, kind: Pet) -> Vec<usize> {
+        let mut ids: Vec<usize> = (0..self.photos.len())
+            .filter(|&id| {
+                let p = &self.photos[id];
+                !self.store.is_archived(&p.path) && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind))
+            })
+            .collect();
+        ids.sort_by(|&a, &b| self.photos[b].taken.cmp(&self.photos[a].taken));
+        ids
+    }
+
+    fn people_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("People & pets").size(30.0).color(TEXT));
+        let shown = self.people.iter().filter(|p| self.show_hidden_people || !p.hidden).count();
+        let status = if let Some(problem) = &self.people_problem {
+            problem.clone()
+        } else if self.analysing {
+            format!("Looking for faces and pets… {} of {} photos", self.analysed, self.analyse_total)
+        } else {
+            format!("{shown} {} · faces are recognised on this computer, nothing is uploaded", if shown == 1 { "person" } else { "people" })
+        };
+        ui.label(egui::RichText::new(status).color(TEXT_DIM));
+        if self.analysing && self.analyse_total > 0 {
+            ui.add(egui::ProgressBar::new(self.analysed as f32 / self.analyse_total as f32).desired_width(360.0));
+        }
+        ui.add_space(14.0);
+
+        let ctx = ui.ctx().clone();
+        let mut budget = 24usize;
+        let mut go = None;
+        let mut wanted = Vec::new();
+        let cards: Vec<(usize, FaceRef, Option<String>, usize, bool)> = self
+            .people
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.show_hidden_people || !p.hidden)
+            .map(|(i, p)| (i, p.cover.clone(), p.name.clone(), p.photos.len(), p.hidden))
+            .collect();
+        let hidden_count = self.people.iter().filter(|p| p.hidden).count();
+        let pets: Vec<(Pet, &str, Vec<usize>)> = [(Pet::Dog, "Dogs"), (Pet::Cat, "Cats")]
+            .into_iter()
+            .map(|(k, label)| (k, label, self.pet_photos(k)))
+            .filter(|(_, _, ids)| !ids.is_empty())
+            .collect();
+
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.label(egui::RichText::new("People").size(18.0).color(TEXT));
+            ui.add_space(8.0);
+            if cards.is_empty() {
+                let msg = if self.analysing { "People will appear here as photos are analysed." } else { "No people found yet. A person shows up once their face is in at least two photos." };
+                ui.label(egui::RichText::new(msg).color(TEXT_DIM));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(18.0, 18.0);
+                for (i, cover, name, count, hidden) in &cards {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(124.0, 170.0), Sense::click());
+                    let circle = Rect::from_center_size(pos2(rect.center().x, rect.top() + 58.0), vec2(112.0, 112.0));
+                    match self.face_texture(&ctx, cover, &mut budget) {
+                        Some(t) => egui::Image::from_texture(&t).corner_radius(CornerRadius::same(56)).paint_at(ui, circle),
+                        None => {
+                            ui.painter().circle_filled(circle.center(), 56.0, FIELD_BG);
+                            ui.painter().text(circle.center(), Align2::CENTER_CENTER, icon::USER, FontId::proportional(40.0), TEXT_DIM);
+                        }
+                    }
+                    if *hidden {
+                        ui.painter().circle_filled(circle.center(), 56.0, Color32::from_black_alpha(150));
+                        ui.painter().text(circle.center(), Align2::CENTER_CENTER, icon::EYE_SLASH, FontId::proportional(28.0), TEXT);
+                    }
+                    if resp.hovered() {
+                        ui.painter().circle_stroke(circle.center(), 59.0, Stroke::new(2.0_f32, ACCENT));
+                    }
+                    let (label, color) = match name {
+                        Some(n) => (n.clone(), TEXT),
+                        None => ("Add a name".to_string(), ACCENT),
+                    };
+                    let text_clip = ui.painter().with_clip_rect(rect);
+                    text_clip.text(pos2(rect.center().x, circle.bottom() + 16.0), Align2::CENTER_CENTER, label, FontId::proportional(14.5), color);
+                    text_clip.text(
+                        pos2(rect.center().x, circle.bottom() + 36.0),
+                        Align2::CENTER_CENTER,
+                        format!("{count} photo{}", if *count == 1 { "" } else { "s" }),
+                        FontId::proportional(12.5),
+                        TEXT_DIM,
+                    );
+                    if resp.clicked() {
+                        go = Some(Page::Person(*i));
+                    }
+                }
+            });
+
+            if !pets.is_empty() {
+                ui.add_space(24.0);
+                ui.label(egui::RichText::new("Pets").size(18.0).color(TEXT));
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(18.0, 18.0);
+                    for (kind, label, ids) in &pets {
+                        let (rect, resp) = ui.allocate_exact_size(vec2(124.0, 170.0), Sense::click());
+                        let circle = Rect::from_center_size(pos2(rect.center().x, rect.top() + 58.0), vec2(112.0, 112.0));
+                        let id = ids[0];
+                        match self.thumbs.get_mut(&id) {
+                            Some((t, seen)) => {
+                                *seen = self.frame;
+                                egui::Image::from_texture(&*t)
+                                    .uv(fill_uv(t.size_vec2(), circle.size()))
+                                    .corner_radius(CornerRadius::same(56))
+                                    .paint_at(ui, circle);
+                            }
+                            None => {
+                                if !self.failed.contains(&id) {
+                                    wanted.push(make_job(self.gen, id, &self.photos[id]));
+                                }
+                                ui.painter().circle_filled(circle.center(), 56.0, FIELD_BG);
+                            }
+                        }
+                        let ic = if *kind == Pet::Dog { icon::DOG } else { icon::CAT };
+                        let badge = circle.right_bottom() - vec2(16.0, 16.0);
+                        ui.painter().circle_filled(badge, 15.0, CONTENT_BG);
+                        ui.painter().text(badge, Align2::CENTER_CENTER, ic, FontId::proportional(18.0), TEXT);
+                        if resp.hovered() {
+                            ui.painter().circle_stroke(circle.center(), 59.0, Stroke::new(2.0_f32, ACCENT));
+                        }
+                        ui.painter().text(pos2(rect.center().x, circle.bottom() + 16.0), Align2::CENTER_CENTER, *label, FontId::proportional(14.5), TEXT);
+                        ui.painter().text(
+                            pos2(rect.center().x, circle.bottom() + 36.0),
+                            Align2::CENTER_CENTER,
+                            format!("{} photo{}", ids.len(), if ids.len() == 1 { "" } else { "s" }),
+                            FontId::proportional(12.5),
+                            TEXT_DIM,
+                        );
+                        if resp.clicked() {
+                            go = Some(Page::Pets(*kind));
+                        }
+                    }
+                });
+            }
+
+            if hidden_count > 0 {
+                ui.add_space(24.0);
+                let label = if self.show_hidden_people { "Hide hidden people".to_string() } else { format!("Show {hidden_count} hidden") };
+                if ui.add(egui::Button::new(egui::RichText::new(label).color(ACCENT)).frame(false)).clicked() {
+                    self.show_hidden_people = !self.show_hidden_people;
+                }
+            }
+        });
+        self.loader.set_wanted(wanted);
+        if let Some(p) = go {
+            self.set_page(p);
+        }
+    }
+
+    /// Avatar, name (click to name), photo count, and rename / hide buttons.
+    fn person_header(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(p) = self.people.get(i) else { return };
+        let (cover, name, count, hidden, keys) = (p.cover.clone(), p.name.clone(), p.photos.len(), p.hidden, p.keys());
+        let ctx = ui.ctx().clone();
+        let mut budget = 4;
+        let tex = self.face_texture(&ctx, &cover, &mut budget);
+        let mut rename = false;
+        let mut toggle_hidden = false;
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(68.0, 68.0), Sense::hover());
+            match &tex {
+                Some(t) => egui::Image::from_texture(t).corner_radius(CornerRadius::same(34)).paint_at(ui, r),
+                None => {
+                    ui.painter().circle_filled(r.center(), 34.0, FIELD_BG);
+                }
+            }
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.add_space(6.0);
+                let (title, color) = match &name {
+                    Some(n) => (n.clone(), TEXT),
+                    None => ("Add a name".to_string(), ACCENT),
+                };
+                if ui.add(egui::Label::new(egui::RichText::new(title).size(28.0).color(color)).sense(Sense::click())).on_hover_text("Name this person").clicked() {
+                    rename = true;
+                }
+                ui.label(egui::RichText::new(format!("{count} photo{}", if count == 1 { "" } else { "s" })).color(TEXT_DIM));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (ic, hint) = if hidden { (icon::EYE, "Show in People & pets") } else { (icon::EYE_SLASH, "Hide this person") };
+                if icon_button(ui, ic, 22.0, hint).clicked() {
+                    toggle_hidden = true;
+                }
+                if icon_button(ui, icon::PENCIL, 22.0, "Name this person").clicked() {
+                    rename = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+        if rename {
+            self.dialog = Some(Dialog::NamePerson { person: i, name: name.unwrap_or_default() });
+        }
+        if toggle_hidden {
+            self.store.hide_faces(&keys, !hidden);
+            self.recluster();
+            if !hidden {
+                self.set_page(Page::People);
+            }
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
         let Some(dialog) = &mut self.dialog else { return };
         let mut confirm = false;
@@ -1342,6 +1725,17 @@ impl PhotosApp {
                     ui.add_space(8.0);
                     confirm |= name_field(ui, name);
                     "Rename"
+                }
+                Dialog::NamePerson { name, .. } => {
+                    ui.label(egui::RichText::new("Who is this?").size(20.0).color(TEXT));
+                    ui.label(egui::RichText::new("Use the same name as another person to merge them.").color(TEXT_DIM));
+                    ui.add_space(8.0);
+                    let r = ui.add(
+                        egui::TextEdit::singleline(name).hint_text("Name").font(FontId::proportional(16.0)).desired_width(f32::INFINITY),
+                    );
+                    r.request_focus();
+                    confirm |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    "Save"
                 }
                 Dialog::DeleteAlbum(i) => {
                     let name = self.store.albums.get(*i).map(|a| a.name.as_str()).unwrap_or("");
@@ -1384,6 +1778,13 @@ impl PhotosApp {
                 Some(Dialog::DeleteAlbum(i)) => {
                     self.store.delete_album(i);
                     self.set_page(Page::Albums);
+                }
+                Some(Dialog::NamePerson { person, name }) => {
+                    if let Some(p) = self.people.get(person) {
+                        let keys = p.keys();
+                        self.store.name_faces(&keys, &name);
+                        self.recluster();
+                    }
                 }
                 None => {}
             }
@@ -1457,6 +1858,8 @@ impl eframe::App for PhotosApp {
                     self.page_header(ui);
                     if self.page == Page::Albums {
                         self.albums_page(ui);
+                    } else if self.page == Page::People {
+                        self.people_page(ui);
                     } else {
                         self.grid(ui);
                     }
@@ -1610,14 +2013,14 @@ fn draw_cell(
     }
 }
 
-/// Every word must match the file name or some form of the date ("2024", "october", "oct", "sunday", "2024-10-06").
-fn matches_search(p: &Photo, terms: &[String]) -> bool {
+/// Every word must match the file name, a person's name, or some form of the date ("2024", "october", "oct", "sunday", "2024-10-06").
+fn matches_search(p: &Photo, terms: &[String], people: &str) -> bool {
     let name = p.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let mut date = p.taken.format("%Y %B %b %A %a %-d %Y-%m-%d").to_string().to_lowercase();
     if p.is_video {
         date += " video videos";
     }
-    terms.iter().all(|t| name.contains(t.as_str()) || date.contains(t.as_str()))
+    terms.iter().all(|t| name.contains(t.as_str()) || date.contains(t.as_str()) || people.contains(t.as_str()))
 }
 
 fn day_label(date: NaiveDate, today: NaiveDate) -> String {
@@ -1674,11 +2077,16 @@ impl PhotosApp {
         let Some(out) = std::env::var_os("BANANA_SCREENSHOT") else { return };
         let var = |k: &str| std::env::var(k).ok();
         let t = ctx.input(|i| i.time);
-        if t > 1.5 && !self.scanning && !self.debug_done {
+        if t > 1.5 && !self.scanning && !self.analysing && !self.people_dirty && !self.debug_done {
             self.debug_done = true;
+            self.debug_done_at = t;
             match var("BANANA_PAGE").as_deref() {
                 Some("favorites") => self.set_page(Page::Favorites),
                 Some("videos") => self.set_page(Page::Videos),
+                Some("people") => self.set_page(Page::People),
+                Some("dogs") => self.set_page(Page::Pets(Pet::Dog)),
+                Some("cats") => self.set_page(Page::Pets(Pet::Cat)),
+                Some(p) if p.starts_with("person") => self.set_page(Page::Person(p[6..].parse().unwrap_or(0))),
                 Some("albums") => self.set_page(Page::Albums),
                 Some("archive") => self.set_page(Page::Archive),
                 Some("recent") => self.set_page(Page::Recent),
@@ -1702,7 +2110,7 @@ impl PhotosApp {
                 self.open_viewer(n, ctx);
             }
         }
-        if t > 4.0 && !self.debug_shot_sent {
+        if self.debug_done && t > self.debug_done_at + 2.5 && !self.debug_shot_sent {
             self.debug_shot_sent = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }

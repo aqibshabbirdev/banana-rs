@@ -1,7 +1,7 @@
 //! Favourites and albums, saved as JSON in the user's data folder. Photos are referenced by
 //! absolute path, so albums survive restarts and re-scans.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,13 @@ pub struct Store {
     /// Hidden from Photos, shown only under Archive.
     #[serde(default)]
     pub archived: HashSet<PathBuf>,
+    /// Names given to people, per face ("<path>#<face index>"). Every face of a person carries
+    /// the name, so it survives re-clustering; two groups with the same name show as one person.
+    #[serde(default)]
+    pub face_names: HashMap<String, String>,
+    /// Faces of people the user hid from People & pets.
+    #[serde(default)]
+    pub hidden_faces: HashSet<String>,
 }
 
 impl Store {
@@ -75,6 +82,30 @@ impl Store {
         self.save();
     }
 
+    /// Names (or, with an empty name, un-names) every face of one person.
+    pub fn name_faces(&mut self, keys: &[String], name: &str) {
+        let name = name.trim();
+        for k in keys {
+            if name.is_empty() {
+                self.face_names.remove(k);
+            } else {
+                self.face_names.insert(k.clone(), name.to_string());
+            }
+        }
+        self.save();
+    }
+
+    pub fn hide_faces(&mut self, keys: &[String], hidden: bool) {
+        for k in keys {
+            if hidden {
+                self.hidden_faces.insert(k.clone());
+            } else {
+                self.hidden_faces.remove(k);
+            }
+        }
+        self.save();
+    }
+
     pub fn create_album(&mut self, name: &str, paths: &[PathBuf]) -> usize {
         self.albums.push(Album { name: self.unique_name(name), photos: Vec::new() });
         let idx = self.albums.len() - 1;
@@ -119,8 +150,13 @@ impl Store {
 }
 
 fn file() -> Option<PathBuf> {
+    Some(data_dir()?.join("library.json"))
+}
+
+/// Where albums, favourites and the face index live (`BANANA_DATA` overrides it for tests).
+pub fn data_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("BANANA_DATA") {
-        return Some(PathBuf::from(dir).join("library.json"));
+        return Some(PathBuf::from(dir));
     }
-    Some(dirs::data_dir()?.join("banana-rs").join("library.json"))
+    Some(dirs::data_dir()?.join("banana-rs"))
 }

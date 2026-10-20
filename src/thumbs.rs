@@ -128,7 +128,7 @@ fn load_thumb(path: &Path, cached: &Path) -> Option<ColorImage> {
 
 /// Decodes upright (EXIF rotation applied, so phone photos are not sideways) and no bigger
 /// than `max_side` on its longest edge.
-fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
+pub fn decode(path: &Path, max_side: u32) -> Option<DynamicImage> {
     #[cfg(target_os = "macos")]
     if crate::library::is_heif(path) {
         return crate::imageio::decode(path, max_side);
