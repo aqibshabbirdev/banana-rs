@@ -15,6 +15,18 @@ Download from the [latest release](https://github.com/aqibshabbirdev/banana-rs/r
 
 **Linux (Ubuntu 24.04+, Debian 13+; x86_64 or arm64)**
 
+Install with apt. This adds the Banana Photos repository, so `sudo apt upgrade` gets new versions too:
+
+```bash
+curl -fsSL https://github.com/aqibshabbirdev/banana-rs/releases/latest/download/banana-photos.gpg | sudo tee /usr/share/keyrings/banana-photos.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/banana-photos.gpg] https://github.com/aqibshabbirdev/banana-rs/releases/latest/download ./" | sudo tee /etc/apt/sources.list.d/banana-photos.list
+sudo apt update && sudo apt install banana-photos
+```
+
+Then open **Banana Photos** from the app menu, or run `banana-rs ~/Pictures`. The repository's signing key fingerprint is `EE4D 8CFC 7508 9E9F 4764  0DBB 7517 3A02 7F9A C63E`.
+
+Or without apt, from the tarball:
+
 ```bash
 sudo apt install libheif1 libheif-plugin-libde265 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
   gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav libxkbcommon-x11-0 libgl1 libegl1 libgl1-mesa-dri
@@ -68,6 +80,10 @@ cargo build --release --no-default-features --features video
 Without the `video` feature, videos still appear in the library and open in the system's default player.
 
 From a Mac, `scripts/build-linux.sh` builds the Linux binary inside Docker (Ubuntu 24.04, `scripts/linux.Dockerfile`) into `target/linux/release/banana-rs`.
+
+### Releasing the apt package
+
+The apt repository is a signed flat repository kept in the assets of each GitHub release, read from `releases/latest/download`. For a release: build both Linux binaries into `dist/rel/banana-rs-<version>-linux-{arm64,x86_64}/` (with `models`), then `scripts/build-deb.sh arm64`, `scripts/build-deb.sh amd64` and `scripts/apt-repo.sh`, and upload everything in `dist/apt/` to the release. Signing needs the "Banana Photos apt repository" GPG key (fingerprint above) in the keyring; keep a backup of it, because a new key would make every user re-add the repository.
 
 ## Mac (Apple Silicon, M1–M4)
 
