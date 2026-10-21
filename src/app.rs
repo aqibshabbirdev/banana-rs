@@ -12,6 +12,7 @@ use eframe::egui::{
 use egui_phosphor::regular as icon;
 
 use crate::clip;
+use crate::duplicates::{self, DupGroup};
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
@@ -58,6 +59,7 @@ enum Page {
     Locked,
     Transfer,
     Screenshots,
+    Duplicates,
     Recent,
     Archive,
     Albums,
@@ -80,6 +82,7 @@ impl Page {
             Page::Documents => 10,
             Page::Locked => 16,
             Page::Transfer => 17,
+            Page::Duplicates => 18,
             Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
             Page::Person(i) => 101 + 2 * i,
@@ -98,6 +101,8 @@ enum Dialog {
     MoveToLocked { paths: Vec<PathBuf>, pass: String, error: Option<String> },
     /// Vault item ids to delete for good.
     DeleteLocked(Vec<String>),
+    /// Move these files to the system Trash.
+    Trash(Vec<PathBuf>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -235,6 +240,8 @@ enum Click {
 
 struct Group {
     date: NaiveDate,
+    /// Heading instead of the day, e.g. on Duplicates ("3 copies · 12 MB").
+    title: Option<String>,
     /// Range into `order`.
     start: usize,
     len: usize,
@@ -368,6 +375,15 @@ pub struct PhotosApp {
     vault_job: Option<VaultJob>,
     vault_notice: Option<String>,
 
+    // Duplicates: groups found for scan `dup_gen`, best copy first; `dup_stamp` says what the
+    // last search saw, so it reruns once the library or its analysis has changed.
+    dups: Vec<DupGroup>,
+    dup_gen: u64,
+    dup_rx: Option<Receiver<(u64, Vec<DupGroup>)>>,
+    dup_stamp: Option<(u64, usize, usize)>,
+    /// Result of the last move to Trash, shown under the page title.
+    notice: Option<String>,
+
     transfer: TransferForm,
     transfer_job: Option<TransferJob>,
     /// Summary and per-file errors of the last finished import or export.
@@ -395,6 +411,8 @@ pub struct PhotosApp {
     debug_shot_sent: bool,
     #[cfg(debug_assertions)]
     debug_done_at: f64,
+    #[cfg(debug_assertions)]
+    debug_trashed: bool,
 }
 
 impl PhotosApp {
@@ -459,6 +477,11 @@ impl PhotosApp {
             vault_form: VaultForm::default(),
             vault_job: None,
             vault_notice: None,
+            dups: Vec::new(),
+            dup_gen: 0,
+            dup_rx: None,
+            dup_stamp: None,
+            notice: None,
             transfer: TransferForm::default(),
             transfer_job: None,
             transfer_result: None,
@@ -480,6 +503,8 @@ impl PhotosApp {
             debug_shot_sent: false,
             #[cfg(debug_assertions)]
             debug_done_at: 0.0,
+            #[cfg(debug_assertions)]
+            debug_trashed: false,
         };
         let moved = crate::access::restore();
         if let Some(dir) = start.or_else(|| load_last_folder(&moved)).or_else(dirs::picture_dir) {
@@ -535,6 +560,7 @@ impl PhotosApp {
             self.lock_vault();
         }
         self.vault_notice = None;
+        self.notice = None;
         self.page = page;
         self.selected.clear();
         self.anchor = None;
@@ -570,6 +596,7 @@ impl PhotosApp {
         }
         self.poll_people(ctx, now);
         self.poll_queries();
+        self.poll_duplicates(ctx);
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -635,7 +662,7 @@ impl PhotosApp {
                 Page::Videos => !archived && p.is_video,
                 Page::Screenshots => !archived && is_screenshot(&p.path),
                 Page::Archive => archived,
-                Page::Albums | Page::People | Page::Locked | Page::Transfer => false,
+                Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates => false,
                 Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                 Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                 Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
@@ -654,7 +681,7 @@ impl PhotosApp {
         // Nothing matched by name, date or person: rank photos by how well they fit the text.
         let mut semantic = None;
         let mut need_query = None;
-        if order.is_empty() && !terms.is_empty() && !self.clip_embeddings.is_empty() {
+        if order.is_empty() && !terms.is_empty() && !self.clip_embeddings.is_empty() && self.page != Page::Duplicates {
             let query = terms.join(" ");
             match self.query_embeddings.get(&query) {
                 Some(q) => {
@@ -676,12 +703,15 @@ impl PhotosApp {
         self.order = order;
 
         self.groups.clear();
+        if self.page == Page::Duplicates {
+            self.fill_duplicates_view();
+        }
         // Search results are best first, so they aren't split into days.
-        for pos in (0..self.order.len()).filter(|_| self.semantic.is_none()) {
+        for pos in (0..self.order.len()).filter(|_| self.semantic.is_none() && self.page != Page::Duplicates) {
             let date = self.when(self.order[pos]).date();
             match self.groups.last_mut() {
                 Some(g) if g.date == date => g.len += 1,
-                _ => self.groups.push(Group { date, start: pos, len: 1 }),
+                _ => self.groups.push(Group { date, title: None, start: pos, len: 1 }),
             }
         }
 
@@ -840,7 +870,10 @@ impl PhotosApp {
         let mut month = None;
         for (gi, g) in self.groups.iter().enumerate() {
             let m = (g.date.year(), g.date.month());
-            if month != Some(m) {
+            if self.page == Page::Duplicates {
+                // Each group starts its own row, so it's clear which photos belong together.
+                flush(&mut pending, &mut rows, &mut y, false);
+            } else if month != Some(m) {
                 flush(&mut pending, &mut rows, &mut y, false);
                 month = Some(m);
                 let title = if g.date.year() == this_year {
@@ -955,6 +988,9 @@ impl PhotosApp {
                     self.view_dirty = true;
                 }
             }
+            if icon_button(ui, icon::TRASH, 22.0, "Move to Trash").clicked() {
+                self.dialog = Some(Dialog::Trash(paths.clone()));
+            }
             if self.vault_job.is_none() && icon_button(ui, icon::LOCK_SIMPLE, 22.0, "Move to Locked Folder").clicked() {
                 self.dialog = Some(Dialog::MoveToLocked { paths: paths.clone(), pass: String::new(), error: None });
             }
@@ -1055,6 +1091,7 @@ impl PhotosApp {
             (icon::PLAY_CIRCLE, "Videos", Page::Videos),
             (icon::USERS_THREE, "People & pets", Page::People),
             (icon::DEVICE_MOBILE, "Screenshots & recordings", Page::Screenshots),
+            (icon::COPY, "Duplicates", Page::Duplicates),
             (icon::CLOCK, "Recently added", Page::Recent),
             (icon::ARCHIVE, "Archive", Page::Archive),
             (icon::LOCK_SIMPLE, "Locked Folder", Page::Locked),
@@ -1111,8 +1148,21 @@ impl PhotosApp {
     // ---------------------------------------------------------------- pages
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
+        if let Some(n) = self.notice.clone() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Label::new(egui::RichText::new(n).color(TEXT)).wrap());
+                if icon_button(ui, icon::X, 16.0, "Dismiss").clicked() {
+                    self.notice = None;
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if self.page == Page::Duplicates {
+            self.duplicates_header(ui);
+            return;
+        }
         let title = match self.page {
-            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer => return,
+            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates => return,
             Page::Person(i) => {
                 self.person_header(ui, i);
                 return;
@@ -1181,6 +1231,12 @@ impl PhotosApp {
                 "Searching…"
             } else if self.analysing && self.clip_model && !self.search.trim().is_empty() {
                 "No matches yet. Photos are still being analysed, and search by what's in them covers more as it goes."
+            } else if self.page == Page::Duplicates && self.dup_rx.is_some() {
+                "Looking for duplicates…"
+            } else if self.page == Page::Duplicates && self.analysing {
+                "No duplicates found yet. Similar shots show up here as photos are analysed."
+            } else if self.page == Page::Duplicates {
+                "No duplicates. Copies of the same file and similar shots taken moments apart show up here."
             } else if !self.search.trim().is_empty() {
                 "No photos match your search."
             } else {
@@ -1213,6 +1269,8 @@ impl PhotosApp {
         let today = Local::now().date_naive();
         let mods = ui.input(|i| i.modifiers);
         let selecting = !self.selected.is_empty();
+        // On Duplicates the first photo of each group is the one suggested to keep.
+        let keep: HashSet<usize> = if self.page == Page::Duplicates { self.groups.iter().map(|g| g.start).collect() } else { HashSet::new() };
         let mut click = None;
         let mut wanted_now = Vec::new();
         let mut wanted_soon = Vec::new();
@@ -1286,6 +1344,9 @@ impl PhotosApp {
                                     resp.hovered() || selecting,
                                     badge,
                                 );
+                                if keep.contains(&item.pos) {
+                                    draw_keep_badge(ui.painter(), rect);
+                                }
 
                                 if resp.clicked() {
                                     let on_check = resp.interact_pointer_pos().is_some_and(|p| check.expand(4.0).contains(p));
@@ -1359,7 +1420,8 @@ impl PhotosApp {
             }
             x += 28.0;
         }
-        painter.text(pos2(x, cy), Align2::LEFT_CENTER, day_label(g.date, today), FontId::proportional(15.0), TEXT);
+        let label = g.title.clone().unwrap_or_else(|| day_label(g.date, today));
+        painter.text(pos2(x, cy), Align2::LEFT_CENTER, label, FontId::proportional(15.0), TEXT);
         resp.clicked()
     }
 
@@ -2107,6 +2169,170 @@ impl PhotosApp {
         }
     }
 
+    /// Wipes what the app keeps about a photo that left the library: cached thumbnail, face
+    /// crops, analysis entry, search embedding, and its name in albums and favourites.
+    fn forget_photo(&mut self, path: &Path, mtime: u64, size: u64) {
+        crate::thumbs::forget_cached(path, mtime, size);
+        if let Some(a) = self.people_index.entries.remove(path) {
+            for i in 0..a.faces.len() {
+                if let Some(crop) = people::crop_path(path, a.mtime, a.size, i) {
+                    let _ = std::fs::remove_file(crop);
+                }
+            }
+            self.people_index_dirty = true;
+        }
+        self.clip_embeddings.remove(path);
+        self.store.forget(path);
+    }
+
+    /// Moves files to the system Trash (Finder's on macOS, the freedesktop one on Linux), then
+    /// re-scans. Photos inside an Apple Photos library are left to Photos.app.
+    fn move_to_trash(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let (skipped, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|p| duplicates::in_photos_library(p));
+        let ctx_trash = duplicates::trash_context();
+        let mut moved = 0;
+        let mut errors = Vec::new();
+        for path in &paths {
+            let info = self.path_index.get(path).map(|&id| (self.photos[id].mtime, self.photos[id].size));
+            match ctx_trash.delete(path) {
+                Ok(()) => {
+                    moved += 1;
+                    if let Some((mtime, size)) = info {
+                        self.forget_photo(path, mtime, size);
+                    }
+                }
+                Err(e) => errors.push(format!("{}: {e}", path.file_name().unwrap_or_default().to_string_lossy())),
+            }
+        }
+        let mut notice = format!("{moved} item{} moved to the Trash.", if moved == 1 { "" } else { "s" });
+        if !skipped.is_empty() {
+            notice += &format!(" {} in an Apple Photos library left alone; delete those in Photos.", skipped.len());
+        }
+        if !errors.is_empty() {
+            notice += &format!(" {} couldn't be moved: {}", errors.len(), errors.join("; "));
+        }
+        self.selected.clear();
+        self.viewer = None;
+        if moved > 0 {
+            if self.people_index_dirty {
+                self.people_index.save();
+                self.people_index_dirty = false;
+            }
+            self.clip_embeddings.save();
+            if let Some(root) = self.root.clone() {
+                self.open_folder(root, ctx);
+            }
+        }
+        // After open_folder, which resets the page state.
+        self.notice = Some(notice);
+    }
+
+    /// Starts a background search for duplicates when the Duplicates page is open and the
+    /// library, or how much of it has been analysed, changed since the last search.
+    fn poll_duplicates(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.dup_rx {
+            if let Ok((gen, groups)) = rx.try_recv() {
+                self.dup_rx = None;
+                self.dups = groups;
+                self.dup_gen = gen;
+                if self.page == Page::Duplicates {
+                    self.view_dirty = true;
+                }
+            }
+        }
+        if self.page != Page::Duplicates || self.scanning || self.dup_rx.is_some() {
+            return;
+        }
+        // While analysis runs, look again every few hundred photos so similar shots trickle in.
+        let stamp = (self.gen, self.photos.len(), if self.analysing { self.analysed / 300 } else { usize::MAX });
+        if self.dup_stamp == Some(stamp) {
+            return;
+        }
+        self.dup_stamp = Some(stamp);
+        let cands: Vec<duplicates::Candidate> = self
+            .photos
+            .iter()
+            .enumerate()
+            .map(|(id, p)| duplicates::Candidate {
+                id,
+                path: p.path.clone(),
+                size: p.size,
+                taken: p.taken,
+                is_video: p.is_video,
+                preferred: self.store.is_favorite(&p.path) || self.store.albums.iter().any(|a| a.photos.contains(&p.path)),
+                strict: is_screenshot(&p.path) || self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
+                embedding: self.clip_embeddings.get(&p.path, p.mtime, p.size).map(clip::Stored::to_vec),
+            })
+            .collect();
+        let (tx, rx) = channel();
+        let (gen, ctx) = (self.gen, ctx.clone());
+        std::thread::spawn(move || {
+            let groups = duplicates::find(&cands);
+            let _ = tx.send((gen, groups));
+            ctx.request_repaint();
+        });
+        self.dup_rx = Some(rx);
+        // Show "Looking for duplicates…" rather than the old groups of a previous scan.
+        if self.dup_gen != self.gen {
+            self.view_dirty = true;
+        }
+    }
+
+    /// `order` and `groups` for the Duplicates page: one group per set of copies or similar shots.
+    fn fill_duplicates_view(&mut self) {
+        self.order.clear();
+        if self.dup_gen != self.gen {
+            return;
+        }
+        for g in &self.dups {
+            let ids: Vec<usize> = g.ids.iter().copied().filter(|&id| id < self.photos.len()).collect();
+            if ids.len() < 2 {
+                continue;
+            }
+            let n = ids.len();
+            let what = if g.exact { format!("{n} copies") } else { format!("{n} similar") };
+            let date = self.photos[ids[0]].taken;
+            let title = format!("{what} · {} · {} to free", date.format("%b %-d, %Y"), human_bytes(g.saving));
+            self.groups.push(Group { date: date.date(), title: Some(title), start: self.order.len(), len: n });
+            self.order.extend(ids);
+        }
+    }
+
+    fn duplicates_header(&mut self, ui: &mut egui::Ui) {
+        let extras: Vec<usize> = self
+            .groups
+            .iter()
+            .flat_map(|g| self.order[g.start + 1..g.start + g.len].iter().copied())
+            .filter(|&id| !duplicates::in_photos_library(&self.photos[id].path))
+            .collect();
+        let freeable: u64 = extras.iter().map(|&id| self.photos[id].size).sum();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Duplicates").size(30.0).color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.dup_rx.is_some() {
+                    ui.spinner();
+                }
+                let b = egui::Button::new(egui::RichText::new(format!("{}  Select all but the best", icon::SELECTION_ALL)).color(ACCENT)).frame(false);
+                if !extras.is_empty() && ui.add(b).on_hover_text("Selects every copy except the one marked Keep in each group").clicked() {
+                    self.selected = extras.iter().copied().collect();
+                }
+            });
+        });
+        let n = self.groups.len();
+        let mut sub = if n == 0 {
+            String::new()
+        } else {
+            format!("{n} group{} · {} can be freed", if n == 1 { "" } else { "s" }, human_bytes(freeable))
+        };
+        if self.analysing {
+            sub += &format!("{}Similar shots are still being found ({} / {} analysed).", if sub.is_empty() { "" } else { " · " }, self.analysed, self.analyse_total);
+        }
+        if !sub.is_empty() {
+            ui.label(egui::RichText::new(sub).color(TEXT_DIM));
+        }
+        ui.add_space(4.0);
+    }
+
     fn lock_vault(&mut self) {
         self.vault = None;
         self.vault_items.clear();
@@ -2206,17 +2432,7 @@ impl PhotosApp {
         // Wipe the plain-text traces a locked photo leaves behind: cached thumbnail, face
         // crops, analysis entry, and its name in albums and favourites.
         for (path, mtime, size) in moved {
-            crate::thumbs::forget_cached(&path, mtime, size);
-            if let Some(a) = self.people_index.entries.remove(&path) {
-                for i in 0..a.faces.len() {
-                    if let Some(crop) = people::crop_path(&path, a.mtime, a.size, i) {
-                        let _ = std::fs::remove_file(crop);
-                    }
-                }
-                self.people_index_dirty = true;
-            }
-            self.clip_embeddings.remove(&path);
-            self.store.forget(&path);
+            self.forget_photo(&path, mtime, size);
         }
         if self.clip_embeddings.dirty {
             self.clip_embeddings.save();
@@ -3154,6 +3370,23 @@ impl PhotosApp {
                     );
                     "Delete"
                 }
+                Dialog::Trash(paths) => {
+                    let (n, bytes) = (paths.len(), paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum::<u64>());
+                    let in_photos = paths.iter().filter(|p| duplicates::in_photos_library(p)).count();
+                    ui.label(egui::RichText::new(format!("{}  Move to Trash?", icon::TRASH)).size(20.0).color(TEXT));
+                    ui.add_space(4.0);
+                    let mut text = format!(
+                        "{} item{} ({}) will be moved to the Trash. You can put them back from there.",
+                        n - in_photos,
+                        if n - in_photos == 1 { "" } else { "s" },
+                        human_bytes(bytes)
+                    );
+                    if in_photos > 0 {
+                        text += &format!(" {in_photos} inside an Apple Photos library will be left alone: delete those in Photos.");
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(TEXT_DIM)).wrap());
+                    "Move to Trash"
+                }
                 Dialog::NamePerson { name, .. } => {
                     ui.label(egui::RichText::new("Who is this?").size(20.0).color(TEXT));
                     ui.label(egui::RichText::new("Use the same name as another person to merge them.").color(TEXT_DIM));
@@ -3235,6 +3468,7 @@ impl PhotosApp {
                         self.vault_view = None;
                     }
                 }
+                Some(Dialog::Trash(paths)) => self.move_to_trash(paths, ctx),
                 Some(Dialog::NamePerson { person, name }) => {
                     if let Some(p) = self.people.get(person) {
                         let keys = p.keys();
@@ -3267,6 +3501,10 @@ impl PhotosApp {
         let (esc, all) = ctx.input(|i| (i.key_pressed(Key::Escape), i.modifiers.command && i.key_pressed(Key::A)));
         if esc {
             self.selected.clear();
+        }
+        let delete = ctx.input(|i| i.key_pressed(Key::Delete) || (i.modifiers.command && i.key_pressed(Key::Backspace)));
+        if delete && !self.selected.is_empty() && !matches!(self.page, Page::Albums | Page::People | Page::Locked | Page::Transfer) {
+            self.dialog = Some(Dialog::Trash(self.selected_paths()));
         }
         if all && self.page != Page::Albums {
             self.selected.extend(self.order.iter().copied());
@@ -3444,6 +3682,14 @@ fn icon_button(ui: &mut egui::Ui, ic: &str, size: f32, hint: &str) -> egui::Resp
 
 fn make_job(gen: u64, id: usize, p: &Photo) -> Job {
     Job { gen, id, path: p.path.clone(), key: cache_key(&p.path, p.mtime, p.size) }
+}
+
+/// "Keep" pill in the bottom-right corner of the photo suggested to keep on Duplicates.
+fn draw_keep_badge(painter: &egui::Painter, rect: Rect) {
+    let galley = painter.layout_no_wrap(format!("{}  Keep", icon::CHECK), FontId::proportional(13.0), PILL_TEXT);
+    let pill = Rect::from_min_size(rect.max - galley.size() - vec2(20.0, 14.0), galley.size() + vec2(12.0, 6.0));
+    painter.rect_filled(pill, CornerRadius::same(10), PILL_BG);
+    painter.galley(pill.min + vec2(6.0, 3.0), galley, PILL_TEXT);
 }
 
 fn draw_tick(painter: &egui::Painter, c: egui::Pos2, color: Color32) {
@@ -3628,6 +3874,7 @@ impl PhotosApp {
                 Some("archive") => self.set_page(Page::Archive),
                 Some("recent") => self.set_page(Page::Recent),
                 Some("screenshots") => self.set_page(Page::Screenshots),
+                Some("duplicates") => self.set_page(Page::Duplicates),
                 Some(p) if p.starts_with("album") => self.set_page(Page::Album(p[5..].parse().unwrap_or(0))),
                 _ => {}
             }
@@ -3662,7 +3909,17 @@ impl PhotosApp {
                 }
             }
         }
-        if self.debug_done && t > self.debug_done_at + 2.5 && !self.debug_shot_sent && self.transfer_job.is_none() && !self.scanning {
+        // BANANA_TRASH_EXTRAS=1 on the Duplicates page: moves all but the best of each group to
+        // the Trash once the groups are in, and takes the screenshot after the re-scan.
+        let trash = var("BANANA_TRASH_EXTRAS").is_some();
+        if trash && self.debug_done && !self.debug_trashed && self.dup_rx.is_none() && self.dup_gen == self.gen && !self.groups.is_empty() {
+            self.debug_trashed = true;
+            let extras: Vec<PathBuf> =
+                self.groups.iter().flat_map(|g| self.order[g.start + 1..g.start + g.len].iter().map(|&id| self.photos[id].path.clone())).collect();
+            self.move_to_trash(extras, ctx);
+            self.debug_done_at = t;
+        }
+        if self.debug_done && t > self.debug_done_at + 2.5 && !self.debug_shot_sent && (!trash || self.debug_trashed) && self.transfer_job.is_none() && !self.scanning && self.dup_rx.is_none() {
             self.debug_shot_sent = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }

@@ -127,6 +127,11 @@ pub struct Stored {
 }
 
 impl Stored {
+    #[cfg(test)]
+    pub fn version(&self) -> (u64, u64) {
+        (self.mtime, self.size)
+    }
+
     pub fn quantize(mtime: u64, size: u64, v: &[f32]) -> Self {
         let max = v.iter().fold(0f32, |m, x| m.max(x.abs()));
         let scale = if max > 0.0 { max / 127.0 } else { 1.0 };
@@ -135,6 +140,13 @@ impl Stored {
 
     pub fn dot(&self, query: &[f32]) -> f32 {
         self.scale * self.values.iter().zip(query).map(|(&q, t)| q as f32 * t).sum::<f32>()
+    }
+
+    /// The embedding back as unit-length floats, for comparing photos with each other.
+    pub fn to_vec(&self) -> Vec<f32> {
+        let mut v: Vec<f32> = self.values.iter().map(|&q| q as f32).collect();
+        normalize(&mut v);
+        v
     }
 }
 
@@ -152,6 +164,12 @@ const MAGIC: &[u8; 8] = b"BCLIP\0\0\x01";
 impl Embeddings {
     fn file() -> Option<PathBuf> {
         Some(crate::store::data_dir()?.join("clip.bin"))
+    }
+
+    /// Every entry of a `clip.bin` file, for dev tools that look at another machine's library.
+    #[cfg(test)]
+    pub fn read_file(file: &Path) -> HashMap<PathBuf, Stored> {
+        std::fs::read(file).ok().and_then(|b| decode(&b)).unwrap_or_default()
     }
 
     pub fn load() -> Self {

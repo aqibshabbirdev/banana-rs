@@ -1,6 +1,7 @@
 mod access;
 mod app;
 mod clip;
+mod duplicates;
 #[cfg(target_os = "macos")]
 mod imageio;
 mod library;
