@@ -12,6 +12,7 @@ use eframe::egui::{
 use egui_phosphor::regular as icon;
 
 use crate::clip;
+use crate::devices::{self, Device};
 use crate::duplicates::{self, DupGroup};
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
@@ -60,6 +61,8 @@ enum Page {
     Transfer,
     Screenshots,
     Duplicates,
+    /// A phone or camera plugged in, by index into `devices`.
+    Device(usize),
     Recent,
     Archive,
     Albums,
@@ -83,6 +86,7 @@ impl Page {
             Page::Locked => 16,
             Page::Transfer => 17,
             Page::Duplicates => 18,
+            Page::Device(i) => 50 + i,
             Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
             Page::Person(i) => 101 + 2 * i,
@@ -187,6 +191,9 @@ impl Default for TransferForm {
         }
     }
 }
+
+/// A device's name and whether its Pictures folder is included.
+type DeviceKey = (String, bool);
 
 struct TransferJob {
     rx: Receiver<transfer::Msg>,
@@ -384,6 +391,19 @@ pub struct PhotosApp {
     /// Result of the last move to Trash, shown under the page title.
     notice: Option<String>,
 
+    // Phones and cameras plugged in (Linux), and what their page has filled in.
+    devices: Vec<Device>,
+    devices_rx: Receiver<Vec<Device>>,
+    device_pictures: bool,
+    device_filter: transfer::Filter,
+    /// (device name, with Pictures) → number and bytes of photos and videos on it.
+    device_counts: HashMap<DeviceKey, (usize, u64)>,
+    device_count_rx: Option<Receiver<(DeviceKey, (usize, u64))>>,
+    /// A device that was just plugged in: a banner offers to import from it, and the sidebar
+    /// scrolls to it once.
+    device_new: Option<String>,
+    device_scroll: bool,
+
     transfer: TransferForm,
     transfer_job: Option<TransferJob>,
     /// Summary and per-file errors of the last finished import or export.
@@ -482,6 +502,14 @@ impl PhotosApp {
             dup_rx: None,
             dup_stamp: None,
             notice: None,
+            devices: Vec::new(),
+            devices_rx: devices::watch(cc.egui_ctx.clone()),
+            device_pictures: false,
+            device_filter: transfer::Filter::default(),
+            device_counts: HashMap::new(),
+            device_count_rx: None,
+            device_new: None,
+            device_scroll: false,
             transfer: TransferForm::default(),
             transfer_job: None,
             transfer_result: None,
@@ -597,6 +625,7 @@ impl PhotosApp {
         self.poll_people(ctx, now);
         self.poll_queries();
         self.poll_duplicates(ctx);
+        self.poll_devices();
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -662,7 +691,7 @@ impl PhotosApp {
                 Page::Videos => !archived && p.is_video,
                 Page::Screenshots => !archived && is_screenshot(&p.path),
                 Page::Archive => archived,
-                Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates => false,
+                Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) => false,
                 Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                 Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                 Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
@@ -1140,6 +1169,31 @@ impl PhotosApp {
             }
         });
 
+        // Phones and cameras, as soon as they're plugged in.
+        if !self.devices.is_empty() {
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.add_space(30.0);
+                ui.label(egui::RichText::new("Devices").size(15.0).color(TEXT));
+            });
+            ui.add_space(6.0);
+            for (i, d) in self.devices.iter().enumerate() {
+                let ic = match d.kind {
+                    devices::Kind::Phone => icon::DEVICE_MOBILE_CAMERA,
+                    devices::Kind::Camera => icon::CAMERA,
+                    devices::Kind::Card => icon::USB,
+                };
+                let r = nav_item(ui, ic, &d.name, self.page == Page::Device(i), None);
+                if r.clicked() {
+                    go = Some(Page::Device(i));
+                }
+                if self.device_scroll && self.device_new.as_ref() == Some(&d.name) {
+                    r.scroll_to_me(Some(egui::Align::Center));
+                    self.device_scroll = false;
+                }
+            }
+        }
+
         if let Some(p) = go {
             self.set_page(p);
         }
@@ -1148,6 +1202,28 @@ impl PhotosApp {
     // ---------------------------------------------------------------- pages
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
+        // "Pixel 7 connected · Import photos", until it's opened or dismissed.
+        if let Some(name) = self.device_new.clone() {
+            let i = self.devices.iter().position(|d| d.name == name);
+            if self.page == Page::Device(i.unwrap_or(usize::MAX)) {
+                self.device_new = None;
+            } else if let Some(i) = i {
+                egui::Frame::new().fill(PILL_BG).corner_radius(CornerRadius::same(14)).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{}  {name} connected", icon::DEVICE_MOBILE_CAMERA)).color(PILL_TEXT));
+                        if ui.add(egui::Button::new(egui::RichText::new("Import photos").color(ACCENT).strong()).frame(false)).clicked() {
+                            self.set_page(Page::Device(i));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_button(ui, icon::X, 16.0, "Dismiss").clicked() {
+                                self.device_new = None;
+                            }
+                        });
+                    });
+                });
+                ui.add_space(8.0);
+            }
+        }
         if let Some(n) = self.notice.clone() {
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(egui::RichText::new(n).color(TEXT)).wrap());
@@ -1162,7 +1238,7 @@ impl PhotosApp {
             return;
         }
         let title = match self.page {
-            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates => return,
+            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) => return,
             Page::Person(i) => {
                 self.person_header(ui, i);
                 return;
@@ -2893,26 +2969,160 @@ impl PhotosApp {
                 self.past_imports_panel(ui);
             }
             ui.add_space(16.0);
-            if let Some(job) = &self.transfer_job {
-                let frac = if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 };
-                let text = if job.total > 0 { format!("{}: {} of {}", job.title, job.done, job.total) } else { job.title.clone() };
-                ui.add(egui::ProgressBar::new(frac).desired_width(520.0).text(text).animate(job.total == 0));
-                if !job.status.is_empty() {
-                    ui.label(egui::RichText::new(&job.status).color(TEXT_DIM));
-                }
-                if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Stop", icon::STOP)).color(ACCENT)).frame(false)).clicked() {
-                    job.cancel.cancel();
+            self.transfer_status(ui);
+        });
+    }
+
+    /// Progress of the running import or export, then the result of the last one.
+    fn transfer_status(&mut self, ui: &mut egui::Ui) {
+        if let Some(job) = &self.transfer_job {
+            let frac = if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 };
+            let text = if job.total > 0 { format!("{}: {} of {}", job.title, job.done, job.total) } else { job.title.clone() };
+            ui.add(egui::ProgressBar::new(frac).desired_width(520.0).text(text).animate(job.total == 0));
+            if !job.status.is_empty() {
+                ui.label(egui::RichText::new(&job.status).color(TEXT_DIM));
+            }
+            if ui.add(egui::Button::new(egui::RichText::new(format!("{}  Stop", icon::STOP)).color(ACCENT)).frame(false)).clicked() {
+                job.cancel.cancel();
+            }
+        }
+        if let Some((summary, errors)) = &self.transfer_result {
+            ui.label(egui::RichText::new(summary).color(ACCENT));
+            for e in errors.iter().take(20) {
+                ui.label(egui::RichText::new(e).color(HEART).size(12.5));
+            }
+            if errors.len() > 20 {
+                ui.label(egui::RichText::new(format!("…and {} more", errors.len() - 20)).color(TEXT_DIM));
+            }
+        }
+    }
+
+    fn poll_devices(&mut self) {
+        let mut latest = None;
+        while let Ok(list) = self.devices_rx.try_recv() {
+            latest = Some(list);
+        }
+        if let Some(list) = latest {
+            // Keep the open device's page on that device, or leave it once it's unplugged.
+            let open = match self.page {
+                Page::Device(i) => self.devices.get(i).map(|d| d.name.clone()),
+                _ => None,
+            };
+            // Ready to import from (not still connecting or locked), and not here before.
+            let ready = |d: &Device| d.root.is_some() && !d.locked();
+            let fresh = list.iter().find(|d| ready(d) && !self.devices.iter().any(|o| o.name == d.name && ready(o))).map(|d| d.name.clone());
+            if fresh.is_some() {
+                self.device_new = fresh;
+                self.device_scroll = true;
+            }
+            self.devices = list;
+            if self.device_new.as_ref().is_some_and(|n| !self.devices.iter().any(|d| &d.name == n)) {
+                self.device_new = None;
+            }
+            if let Some(name) = open {
+                match self.devices.iter().position(|d| d.name == name) {
+                    Some(i) => self.page = Page::Device(i),
+                    None => self.set_page(Page::Photos),
                 }
             }
-            if let Some((summary, errors)) = &self.transfer_result {
-                ui.label(egui::RichText::new(summary).color(ACCENT));
-                for e in errors.iter().take(20) {
-                    ui.label(egui::RichText::new(e).color(HEART).size(12.5));
+            self.device_counts.clear();
+        }
+        if let Some(rx) = &self.device_count_rx {
+            if let Ok((key, count)) = rx.try_recv() {
+                self.device_counts.insert(key, count);
+                self.device_count_rx = None;
+            }
+        }
+    }
+
+    /// Copies the device's photos into Imported/<device name>; ones imported before are skipped.
+    fn start_device_import(&mut self, d: &Device, ctx: &egui::Context) {
+        let Some(root) = &self.root else { return };
+        let (dirs, dest, filter) = (self.device_dirs(d), root.join("Imported").join(&d.name), self.device_filter.clone());
+        self.start_transfer(format!("Importing from {}", d.name), ctx, move |cancel, r| transfer::spawn_folder_import(dirs, dest, filter, cancel, r));
+    }
+
+    fn device_dirs(&self, d: &Device) -> Vec<PathBuf> {
+        let mut dirs = d.camera_dirs.clone();
+        if self.device_pictures {
+            dirs.extend(d.picture_dirs.iter().cloned());
+        }
+        dirs
+    }
+
+    /// A phone or camera: what's on it, and importing its photos into the library.
+    fn device_page(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(d) = self.devices.get(i).cloned() else { return };
+        let ctx = ui.ctx().clone();
+        ui.label(egui::RichText::new(&d.name).size(30.0).color(TEXT));
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.set_max_width(820.0);
+            if d.root.is_none() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Connecting…").color(TEXT_DIM));
+                });
+                return;
+            }
+            if d.locked() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Unlock your phone. If it asks what the USB connection is for, choose File transfer. Its photos show up here a few seconds later.")
+                            .color(TEXT_DIM),
+                    )
+                    .wrap(),
+                );
+                return;
+            }
+            let dirs = self.device_dirs(&d);
+            let key = (d.name.clone(), self.device_pictures);
+            match self.device_counts.get(&key) {
+                Some(&(n, bytes)) => {
+                    ui.label(egui::RichText::new(format!("{n} photos and videos · {}", human_bytes(bytes))).color(TEXT_DIM));
                 }
-                if errors.len() > 20 {
-                    ui.label(egui::RichText::new(format!("…and {} more", errors.len() - 20)).color(TEXT_DIM));
+                None => {
+                    if self.device_count_rx.is_none() {
+                        let (tx, rx) = channel();
+                        let (dirs, key, ctx) = (dirs.clone(), key.clone(), ctx.clone());
+                        std::thread::spawn(move || {
+                            let files: Vec<PathBuf> = dirs.iter().flat_map(|d| transfer::media_files(d)).collect();
+                            let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+                            let _ = tx.send((key, (files.len(), bytes)));
+                            ctx.request_repaint();
+                        });
+                        self.device_count_rx = Some(rx);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Counting photos…").color(TEXT_DIM));
+                    });
                 }
             }
+            ui.add_space(10.0);
+            if !d.picture_dirs.is_empty() {
+                ui.checkbox(&mut self.device_pictures, "Also screenshots and pictures saved by other apps (the Pictures folder)");
+            }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Only import").color(TEXT));
+            Self::filter_fields(ui, &mut self.device_filter, "Name contains", "device");
+
+            let dest = self.root.as_ref().map(|r| r.join("Imported").join(&d.name));
+            ui.add_space(8.0);
+            match &dest {
+                Some(p) => ui.label(egui::RichText::new(format!("Into {} (year/month folders). Photos imported before are skipped.", p.display())).color(TEXT_DIM).size(12.5)),
+                None => ui.label(egui::RichText::new("Open a library folder first.").color(HEART)),
+            };
+            ui.add_space(8.0);
+            let ready = dest.is_some() && self.transfer_job.is_none() && self.device_filter.date_error().is_none() && !dirs.is_empty();
+            let b = egui::Button::new(egui::RichText::new(format!("{}  Import photos", icon::TRAY_ARROW_DOWN)).color(Color32::from_rgb(6, 46, 111)))
+                .fill(ACCENT)
+                .corner_radius(CornerRadius::same(18))
+                .min_size(vec2(180.0, 40.0));
+            if ui.add_enabled(ready, b).clicked() {
+                self.start_device_import(&d, &ctx);
+            }
+            ui.add_space(16.0);
+            self.transfer_status(ui);
         });
     }
 
@@ -3102,7 +3312,7 @@ impl PhotosApp {
         let title = format!("Importing from {label}");
         let job_separate = separate.map(|name| (name, dest.clone(), t.separate_hide));
         self.start_transfer(title, ctx, move |cancel, r| match t.source {
-                ImportSource::Folder => transfer::spawn_folder_import(t.folder_source.unwrap(), dest, t.import_filter, cancel, r),
+                ImportSource::Folder => transfer::spawn_folder_import(vec![t.folder_source.unwrap()], dest, t.import_filter, cancel, r),
                 ImportSource::Takeout => transfer::spawn_takeout_import(t.takeout_sources, dest, t.import_filter, cancel, r),
                 ImportSource::Google => transfer::google::spawn_picker_import(t.google, dest, t.import_filter, cancel, r),
                 #[cfg(target_os = "macos")]
@@ -3569,6 +3779,8 @@ impl eframe::App for PhotosApp {
                         self.transfer_page(ui);
                     } else if self.page == Page::Locked {
                         self.locked_page(ui);
+                    } else if let Page::Device(i) = self.page {
+                        self.device_page(ui, i);
                     } else {
                         self.grid(ui);
                     }
@@ -3875,6 +4087,15 @@ impl PhotosApp {
                 Some("recent") => self.set_page(Page::Recent),
                 Some("screenshots") => self.set_page(Page::Screenshots),
                 Some("duplicates") => self.set_page(Page::Duplicates),
+                // BANANA_PAGE=device0, and BANANA_DEVICE_IMPORT=1 (with BANANA_DEVICE_PICTURES=1) to import from it.
+                Some(p) if p.starts_with("device") => {
+                    let i = p[6..].parse().unwrap_or(0);
+                    self.set_page(Page::Device(i));
+                    self.device_pictures = var("BANANA_DEVICE_PICTURES").is_some();
+                    if let (Some(d), Some(_)) = (self.devices.get(i).cloned(), var("BANANA_DEVICE_IMPORT")) {
+                        self.start_device_import(&d, ctx);
+                    }
+                }
                 Some(p) if p.starts_with("album") => self.set_page(Page::Album(p[5..].parse().unwrap_or(0))),
                 _ => {}
             }

@@ -239,16 +239,14 @@ pub fn spawn_export(items: Vec<ExportItem>, dest: PathBuf, by_month: bool, cance
 
 // ---------------------------------------------------------------- folder or drive
 
-pub fn spawn_folder_import(src: PathBuf, dest: PathBuf, filter: Filter, cancel: Cancel, r: Reporter) {
+/// Copies the photos and videos in `srcs` (a folder or drive, or a phone's DCIM folders).
+pub fn spawn_folder_import(srcs: Vec<PathBuf>, dest: PathBuf, filter: Filter, cancel: Cancel, r: Reporter) {
     std::thread::spawn(move || {
-        r.status(format!("Looking through {}…", src.display()));
-        let files: Vec<PathBuf> = walkdir::WalkDir::new(&src)
-            .into_iter()
-            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file() && is_media(e.path()))
-            .map(|e| e.into_path())
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for src in &srcs {
+            r.status(format!("Looking through {}…", src.display()));
+            files.extend(media_files(src));
+        }
         let picked: Vec<(PathBuf, NaiveDateTime, u64)> = files
             .into_iter()
             .filter_map(|p| {
@@ -285,6 +283,17 @@ pub fn spawn_folder_import(src: PathBuf, dest: PathBuf, filter: Filter, cancel: 
         }
         r.send(Msg::Done(summary("Imported", copied, skipped, failed, cancel.cancelled())));
     });
+}
+
+/// Photos and videos in a folder and its sub-folders, skipping hidden ones (".thumbnails").
+pub fn media_files(dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && is_media(e.path()))
+        .map(|e| e.into_path())
+        .collect()
 }
 
 // ---------------------------------------------------------------- Google Takeout
