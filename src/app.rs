@@ -23,6 +23,8 @@ use crate::vault;
 use crate::video;
 
 const MAX_TEXTURES: usize = 3000;
+#[cfg(target_os = "macos")]
+const IC_POLL: f64 = 0.5;
 const KEEP_TEXTURES: usize = 2000;
 
 // Layout.
@@ -403,6 +405,11 @@ pub struct PhotosApp {
     /// scrolls to it once.
     device_new: Option<String>,
     device_scroll: bool,
+    /// macOS: phones and cameras through Image Capture, read every `IC_POLL` seconds.
+    #[cfg(target_os = "macos")]
+    image_capture: Option<devices::mac::ImageCapture>,
+    #[cfg(target_os = "macos")]
+    last_ic_poll: f64,
 
     transfer: TransferForm,
     transfer_job: Option<TransferJob>,
@@ -510,6 +517,10 @@ impl PhotosApp {
             device_count_rx: None,
             device_new: None,
             device_scroll: false,
+            #[cfg(target_os = "macos")]
+            image_capture: objc2::MainThreadMarker::new().map(|mtm| devices::mac::ImageCapture::new(mtm, cc.egui_ctx.clone())),
+            #[cfg(target_os = "macos")]
+            last_ic_poll: 0.0,
             transfer: TransferForm::default(),
             transfer_job: None,
             transfer_result: None,
@@ -625,7 +636,7 @@ impl PhotosApp {
         self.poll_people(ctx, now);
         self.poll_queries();
         self.poll_duplicates(ctx);
-        self.poll_devices();
+        self.poll_devices(now);
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -2997,11 +3008,24 @@ impl PhotosApp {
         }
     }
 
-    fn poll_devices(&mut self) {
+    fn poll_devices(&mut self, now: f64) {
         let mut latest = None;
         while let Ok(list) = self.devices_rx.try_recv() {
             latest = Some(list);
         }
+        #[cfg(target_os = "macos")]
+        if let Some(ic) = &mut self.image_capture {
+            ic.poll();
+            if now - self.last_ic_poll >= IC_POLL {
+                self.last_ic_poll = now;
+                let list = ic.devices();
+                if list != self.devices {
+                    latest = Some(list);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = now;
         if let Some(list) = latest {
             // Keep the open device's page on that device, or leave it once it's unplugged.
             let open = match self.page {
@@ -3009,7 +3033,7 @@ impl PhotosApp {
                 _ => None,
             };
             // Ready to import from (not still connecting or locked), and not here before.
-            let ready = |d: &Device| d.root.is_some() && !d.locked();
+            let ready = |d: &Device| !d.connecting() && !d.locked();
             let fresh = list.iter().find(|d| ready(d) && !self.devices.iter().any(|o| o.name == d.name && ready(o))).map(|d| d.name.clone());
             if fresh.is_some() {
                 self.device_new = fresh;
@@ -3039,7 +3063,20 @@ impl PhotosApp {
     fn start_device_import(&mut self, d: &Device, ctx: &egui::Context) {
         let Some(root) = &self.root else { return };
         let (dirs, dest, filter) = (self.device_dirs(d), root.join("Imported").join(&d.name), self.device_filter.clone());
-        self.start_transfer(format!("Importing from {}", d.name), ctx, move |cancel, r| transfer::spawn_folder_import(dirs, dest, filter, cancel, r));
+        let title = format!("Importing from {}", d.name);
+        #[cfg(target_os = "macos")]
+        if let Some(info) = &d.ic {
+            // Image Capture downloads run on this thread; `poll_devices` drives them.
+            let mut ic = self.image_capture.take();
+            self.start_transfer(title, ctx, |cancel, r| {
+                if let Some(ic) = &mut ic {
+                    ic.start_import(&info.id, dest, filter, cancel, r);
+                }
+            });
+            self.image_capture = ic;
+            return;
+        }
+        self.start_transfer(title, ctx, move |cancel, r| transfer::spawn_folder_import(dirs, dest, filter, cancel, r));
     }
 
     fn device_dirs(&self, d: &Device) -> Vec<PathBuf> {
@@ -3057,27 +3094,27 @@ impl PhotosApp {
         ui.label(egui::RichText::new(&d.name).size(30.0).color(TEXT));
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.set_max_width(820.0);
-            if d.root.is_none() {
+            if d.locked() {
+                let how = if d.ic.is_some() {
+                    "Unlock it, and tap Trust if it asks whether to trust this computer. Its photos show up here a few seconds later."
+                } else {
+                    "Unlock your phone. If it asks what the USB connection is for, choose File transfer. Its photos show up here a few seconds later."
+                };
+                ui.add(egui::Label::new(egui::RichText::new(how).color(TEXT_DIM)).wrap());
+                return;
+            }
+            if d.connecting() {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(egui::RichText::new("Connecting…").color(TEXT_DIM));
                 });
                 return;
             }
-            if d.locked() {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Unlock your phone. If it asks what the USB connection is for, choose File transfer. Its photos show up here a few seconds later.")
-                            .color(TEXT_DIM),
-                    )
-                    .wrap(),
-                );
-                return;
-            }
             let dirs = self.device_dirs(&d);
             let key = (d.name.clone(), self.device_pictures);
-            match self.device_counts.get(&key) {
-                Some(&(n, bytes)) => {
+            let known = d.ic.as_ref().map(|ic| (ic.count, ic.bytes)).or_else(|| self.device_counts.get(&key).copied());
+            match known {
+                Some((n, bytes)) => {
                     ui.label(egui::RichText::new(format!("{n} photos and videos · {}", human_bytes(bytes))).color(TEXT_DIM));
                 }
                 None => {
@@ -3113,7 +3150,8 @@ impl PhotosApp {
                 None => ui.label(egui::RichText::new("Open a library folder first.").color(HEART)),
             };
             ui.add_space(8.0);
-            let ready = dest.is_some() && self.transfer_job.is_none() && self.device_filter.date_error().is_none() && !dirs.is_empty();
+            let has_photos = !dirs.is_empty() || d.ic.as_ref().is_some_and(|ic| ic.count > 0);
+            let ready = dest.is_some() && self.transfer_job.is_none() && self.device_filter.date_error().is_none() && has_photos;
             let b = egui::Button::new(egui::RichText::new(format!("{}  Import photos", icon::TRAY_ARROW_DOWN)).color(Color32::from_rgb(6, 46, 111)))
                 .fill(ACCENT)
                 .corner_radius(CornerRadius::same(18))
@@ -3165,6 +3203,14 @@ impl PhotosApp {
         ];
         if cfg!(target_os = "macos") {
             sources.insert(0, (ImportSource::MacPhotos, icon::IMAGES, "Mac Photos", "The Photos app on this Mac"));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}  iPhone, camera or Android phone: plug it in and it shows under Devices in the sidebar. On Android, choose the USB mode Transfer photos (PTP).",
+                    icon::DEVICE_MOBILE_CAMERA
+                ))
+                .color(TEXT_DIM),
+            );
+            ui.add_space(8.0);
         }
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(12.0, 12.0);

@@ -6,7 +6,10 @@
 //! USB device itself, which gvfs already holds. A phone that is plugged in but not mounted yet
 //! (gvfs lists it as a volume) is mounted with `gio mount`, as the file manager does when its
 //! icon is clicked. Camera cards and phones in USB-drive mode under /media or /run/media count
-//! too when they have a DCIM folder. Other systems: nothing is listed.
+//! too when they have a DCIM folder. On macOS, see `mac`: Image Capture instead of gvfs.
+
+#[cfg(target_os = "macos")]
+pub mod mac;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
@@ -23,6 +26,21 @@ pub struct Device {
     /// Pictures on each storage: screenshots and pictures saved by other apps.
     pub picture_dirs: Vec<PathBuf>,
     pub kind: Kind,
+    /// Set for a device read through Image Capture (macOS) rather than a folder.
+    pub ic: Option<IcInfo>,
+}
+
+/// What Image Capture reports about a phone or camera (macOS).
+#[derive(Clone, PartialEq, Debug)]
+pub struct IcInfo {
+    /// The device's UUID, to find it again for an import.
+    pub id: String,
+    /// An iPhone that is locked or hasn't been told to trust this Mac.
+    pub locked: bool,
+    /// Its list of photos is complete.
+    pub ready: bool,
+    pub count: usize,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,7 +54,18 @@ impl Device {
     /// Mounted but nothing readable: an Android phone shows no storage until it is unlocked
     /// and set to "File transfer".
     pub fn locked(&self) -> bool {
-        self.root.is_some() && self.camera_dirs.is_empty() && self.picture_dirs.is_empty()
+        match &self.ic {
+            Some(ic) => ic.locked,
+            None => self.root.is_some() && self.camera_dirs.is_empty() && self.picture_dirs.is_empty(),
+        }
+    }
+
+    /// Plugged in, but not readable yet (being mounted, or its photo list is still loading).
+    pub fn connecting(&self) -> bool {
+        match &self.ic {
+            Some(ic) => !ic.ready && !ic.locked,
+            None => self.root.is_none(),
+        }
     }
 }
 
@@ -44,6 +73,9 @@ impl Device {
 /// that appear unmounted (once each).
 pub fn watch(ctx: eframe::egui::Context) -> Receiver<Vec<Device>> {
     let (tx, rx) = channel();
+    if !cfg!(target_os = "linux") {
+        return rx;
+    }
     std::thread::spawn(move || {
         let mut last: Option<Vec<Device>> = None;
         let mut tried_mount: Vec<String> = Vec::new();
@@ -86,7 +118,7 @@ fn scan() -> (Vec<Device>, Vec<String>) {
             };
             let root = e.path();
             let name = display_name(&root).unwrap_or_else(|| name_from_host(&dir_name));
-            devices.push(with_photo_dirs(Device { name, root: Some(root), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind }));
+            devices.push(with_photo_dirs(Device { name, root: Some(root), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind, ic: None }));
         }
     }
     devices.extend(cards());
@@ -99,7 +131,7 @@ fn scan() -> (Vec<Device>, Vec<String>) {
         let mounted = devices.iter().any(|d| d.root.as_ref().is_some_and(|r| r.to_string_lossy().contains(host)));
         if !mounted {
             let kind = if uri.starts_with("mtp:") { Kind::Phone } else { Kind::Camera };
-            devices.push(Device { name, root: None, camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind });
+            devices.push(Device { name, root: None, camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind, ic: None });
             unmounted.push(uri);
         }
     }
@@ -147,7 +179,7 @@ fn cards() -> Vec<Device> {
             let root = e.path();
             if root.join("DCIM").is_dir() {
                 let name = e.file_name().to_string_lossy().to_string();
-                out.push(with_photo_dirs(Device { name, root: Some(root), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind: Kind::Card }));
+                out.push(with_photo_dirs(Device { name, root: Some(root), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind: Kind::Card, ic: None }));
             }
         }
     }
@@ -238,14 +270,14 @@ mod tests {
         for d in ["Internal shared storage/DCIM/Camera", "Internal shared storage/Pictures/Screenshots", "SD card/DCIM", "SD card/Music"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
-        let d = with_photo_dirs(Device { name: "P".into(), root: Some(root.clone()), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind: Kind::Phone });
+        let d = with_photo_dirs(Device { name: "P".into(), root: Some(root.clone()), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind: Kind::Phone, ic: None });
         let _ = std::fs::remove_dir_all(&root);
         let mut cams = d.camera_dirs.clone();
         cams.sort();
         assert_eq!(cams, vec![root.join("Internal shared storage/DCIM"), root.join("SD card/DCIM")]);
         assert_eq!(d.picture_dirs, vec![root.join("Internal shared storage/Pictures")]);
         assert!(!d.locked());
-        let empty = Device { name: "P".into(), root: Some(root), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind: Kind::Phone };
+        let empty = Device { name: "P".into(), root: Some(root), camera_dirs: Vec::new(), picture_dirs: Vec::new(), kind: Kind::Phone, ic: None };
         assert!(empty.locked());
     }
 }

@@ -165,13 +165,24 @@ fn plain_name(name: &str) -> String {
 /// with the same size. `None` means "already have it".
 fn target(dest: &Path, name: &str, taken: NaiveDateTime, size: u64, by_month: bool) -> std::io::Result<Option<PathBuf>> {
     let name = &plain_name(name);
-    let dir = if by_month { dest.join(format!("{}", taken.year())).join(taken.format("%m %B").to_string()) } else { dest.to_path_buf() };
+    let dir = if by_month { month_dir(dest, taken) } else { dest.to_path_buf() };
     std::fs::create_dir_all(&dir)?;
     let same = dir.join(name);
     if std::fs::metadata(&same).is_ok_and(|m| m.len() == size) {
         return Ok(None);
     }
     Ok(Some(free_name(&dir, name)))
+}
+
+fn month_dir(dest: &Path, taken: NaiveDateTime) -> PathBuf {
+    dest.join(format!("{}", taken.year())).join(taken.format("%m %B").to_string())
+}
+
+/// True when an earlier import already put this file in its year/month folder, so an import
+/// that has to download each file (from a phone) can skip it without downloading.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn already_imported(dest: &Path, name: &str, taken: NaiveDateTime, size: u64) -> bool {
+    std::fs::metadata(month_dir(dest, taken).join(plain_name(name))).is_ok_and(|m| m.len() == size)
 }
 
 /// Sets the file's modified time, which the library uses when a photo has no EXIF date.

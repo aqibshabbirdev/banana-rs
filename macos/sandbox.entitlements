@@ -12,6 +12,8 @@
   <key>com.apple.security.assets.pictures.read-write</key><true/>
   <!-- Import from the Photos app (PhotoKit). -->
   <key>com.apple.security.personal-information.photos-library</key><true/>
+  <!-- Import from iPhones, cameras and Android phones over USB (Image Capture, src/devices/mac.rs). -->
+  <key>com.apple.security.device.usb</key><true/>
   <!-- Google Photos import: HTTPS to Google, and a 127.0.0.1 listener for the sign-in redirect. -->
   <key>com.apple.security.network.client</key><true/>
   <key>com.apple.security.network.server</key><true/>
