@@ -72,7 +72,10 @@ if [ -n "$NOTARY_PROFILE" ] && [ "$SIGN_ID" = "-" ]; then
   exit 1
 fi
 
-export MACOSX_DEPLOYMENT_TARGET=11.0
+# The App Store takes Apple Silicon-only Macs apps from macOS 12 up; the dmg still runs on 11.
+MIN_MACOS=11.0
+[ -n "$APPSTORE" ] && MIN_MACOS=12.0
+export MACOSX_DEPLOYMENT_TARGET=$MIN_MACOS
 rustup target add "$TARGET" >/dev/null 2>&1 || true
 
 echo "==> Building release binary ($TARGET)"
@@ -113,7 +116,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
   <key>LSArchitecturePriority</key><array><string>arm64</string></array>
   <key>NSHighResolutionCapable</key><true/>
