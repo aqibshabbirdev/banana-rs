@@ -36,21 +36,13 @@ pub struct Store {
 
 impl Store {
     pub fn load() -> Self {
-        file()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        file().map(|f| load_json(&f)).unwrap_or_default()
     }
 
-    /// Writes to a temp file then renames, so a crash mid-write can't wipe the albums.
     pub fn save(&self) {
         let Some(file) = file() else { return };
-        let _ = std::fs::create_dir_all(file.parent().unwrap());
-        let tmp = file.with_extension("json.tmp");
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &file);
-            }
+            write_atomic(&file, &json);
         }
     }
 
@@ -190,4 +182,45 @@ pub fn data_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     Some(dirs::data_dir()?.join("banana-rs"))
+}
+
+/// Reads a JSON file, or the default when there is none. A file that exists but can't be read
+/// is first renamed to "<name>.broken-<time>", so the next save can't overwrite what was in it.
+pub fn load_json<T: Default + serde::de::DeserializeOwned>(file: &Path) -> T {
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return T::default(),
+        Err(_) => {
+            set_aside(file);
+            return T::default();
+        }
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        set_aside(file);
+        T::default()
+    })
+}
+
+fn set_aside(file: &Path) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut name = file.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".broken-{secs}"));
+    let _ = std::fs::rename(file, file.with_file_name(name));
+}
+
+/// Writes to a temp file, syncs it, then renames, so a crash or power cut mid-write can't
+/// leave a cut-short file in place of the old one.
+pub fn write_atomic(file: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(file.parent().unwrap());
+    let mut tmp_name = file.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = file.with_file_name(tmp_name);
+    let ok = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    if ok.is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
 }

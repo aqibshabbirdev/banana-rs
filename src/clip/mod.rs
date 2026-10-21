@@ -178,6 +178,13 @@ impl Embeddings {
         self.dirty = true;
     }
 
+    /// Drops a photo's embedding, e.g. once it's moved into Locked Folder.
+    pub fn remove(&mut self, path: &Path) {
+        if self.entries.remove(path).is_some() {
+            self.dirty = true;
+        }
+    }
+
     /// True when the photo has an entry for this version of the file.
     pub fn has(&self, path: &Path, mtime: u64, size: u64) -> bool {
         self.entries.get(path).is_some_and(|s| s.mtime == mtime && s.size == size)

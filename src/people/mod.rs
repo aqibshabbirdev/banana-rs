@@ -114,20 +114,13 @@ impl Index {
     }
 
     pub fn load() -> Self {
-        Self::file()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        Self::file().map(|f| crate::store::load_json(&f)).unwrap_or_default()
     }
 
     pub fn save(&self) {
         let Some(file) = Self::file() else { return };
-        let _ = std::fs::create_dir_all(file.parent().unwrap());
-        let tmp = file.with_extension("json.tmp");
         if let Ok(json) = serde_json::to_vec(self) {
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &file);
-            }
+            crate::store::write_atomic(&file, &json);
         }
     }
 

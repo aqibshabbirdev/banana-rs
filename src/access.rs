@@ -28,28 +28,35 @@ pub fn remember(path: &Path) {
 }
 
 /// Restarts access to everything remembered. Call once at launch, before opening the last folder.
-pub fn restore() {
+/// Returns the remembered places that were moved or renamed since, as (bookmark file, new path);
+/// see `new_location`.
+pub fn restore() -> Vec<(PathBuf, PathBuf)> {
+    #[allow(unused_mut)]
+    let mut moved = Vec::new();
     #[cfg(target_os = "macos")]
     {
-        let Some(entries) = dir().and_then(|d| std::fs::read_dir(d).ok()) else { return };
+        let Some(entries) = dir().and_then(|d| std::fs::read_dir(d).ok()) else { return moved };
         for entry in entries.flatten() {
             let file = entry.path();
             let Ok(bytes) = std::fs::read(&file) else { continue };
-            match mac::resolve(&bytes) {
-                Some((path, stale)) => {
-                    // Moved or renamed since: save a fresh bookmark under the new path.
-                    if stale {
-                        let _ = std::fs::remove_file(&file);
-                        remember(&path);
-                    }
-                }
-                // The folder is gone; forget it.
-                None => {
-                    let _ = std::fs::remove_file(&file);
-                }
+            // A bookmark that doesn't resolve is kept: the folder may be on a drive that's
+            // unplugged right now, and removing it would lose access for good once it's back.
+            let Some((path, stale)) = mac::resolve(&bytes) else { continue };
+            // Moved or renamed since: save a fresh bookmark under the new path.
+            if stale {
+                let _ = std::fs::remove_file(&file);
+                remember(&path);
+                moved.push((file, path));
             }
         }
     }
+    moved
+}
+
+/// Where `old` is now, if `restore` found it was moved or renamed.
+pub fn new_location(moved: &[(PathBuf, PathBuf)], old: &Path) -> Option<PathBuf> {
+    let file = file_for(old)?;
+    moved.iter().find(|(f, _)| *f == file).map(|(_, p)| p.clone())
 }
 
 /// Opens a file in its default app. NSWorkspace rather than `open`, which the sandbox may refuse to run.

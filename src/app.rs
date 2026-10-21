@@ -481,8 +481,8 @@ impl PhotosApp {
             #[cfg(debug_assertions)]
             debug_done_at: 0.0,
         };
-        crate::access::restore();
-        if let Some(dir) = start.or_else(load_last_folder).or_else(dirs::picture_dir) {
+        let moved = crate::access::restore();
+        if let Some(dir) = start.or_else(|| load_last_folder(&moved)).or_else(dirs::picture_dir) {
             app.open_folder(dir, &cc.egui_ctx);
         }
         app
@@ -2129,6 +2129,11 @@ impl PhotosApp {
                 errors.push(format!("{}: inside an Apple Photos library, which only Photos.app may change", path.display()));
                 continue;
             }
+            // Deleting a symlink or one of several hard links would leave the photo itself on disk.
+            if let Some(why) = linked_elsewhere(&path) {
+                errors.push(format!("{}: {why}, so the photo would stay on disk; move the original file instead", path.display()));
+                continue;
+            }
             let Some(&id) = self.path_index.get(&path) else { continue };
             let p = &self.photos[id];
             jobs.push((path, p.taken, p.mtime, p.size, p.is_video, p.aspect));
@@ -2210,7 +2215,11 @@ impl PhotosApp {
                 }
                 self.people_index_dirty = true;
             }
+            self.clip_embeddings.remove(&path);
             self.store.forget(&path);
+        }
+        if self.clip_embeddings.dirty {
+            self.clip_embeddings.save();
         }
         if finished {
             let job = self.vault_job.take().unwrap();
@@ -3549,8 +3558,12 @@ fn last_folder_file() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("banana-rs").join("last_folder"))
 }
 
-fn load_last_folder() -> Option<PathBuf> {
-    let path = PathBuf::from(std::fs::read_to_string(last_folder_file()?).ok()?.trim());
+fn load_last_folder(moved: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+    let mut path = PathBuf::from(std::fs::read_to_string(last_folder_file()?).ok()?.trim());
+    if let Some(now) = crate::access::new_location(moved, &path) {
+        save_last_folder(&now);
+        path = now;
+    }
     path.is_dir().then_some(path)
 }
 
@@ -3667,4 +3680,20 @@ impl PhotosApp {
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+/// Why deleting `path` wouldn't remove the photo: it's a symlink, or the file has other hard links.
+fn linked_elsewhere(path: &Path) -> Option<&'static str> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some("it's a shortcut (symlink) to another file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return Some("the file has other hard links");
+        }
+    }
+    None
 }

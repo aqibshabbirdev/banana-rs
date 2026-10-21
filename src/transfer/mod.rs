@@ -153,9 +153,18 @@ pub fn free_name(dir: &Path, name: &str) -> PathBuf {
     (2..).map(|i| dir.join(format!("{stem} ({i}){ext}"))).find(|c| !c.exists()).unwrap()
 }
 
+/// A name from a zip or a server, cut down to one plain file name, so "../x", "a\\..\\x" or
+/// "/etc/x" can't write outside the destination.
+fn plain_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    let last: String = last.chars().filter(|c| !c.is_control() && *c != ':').collect();
+    if last.is_empty() || last == "." || last == ".." { "unnamed".to_string() } else { last }
+}
+
 /// Where a file goes: in a year/month subfolder (or flat), skipping one that's already there
 /// with the same size. `None` means "already have it".
 fn target(dest: &Path, name: &str, taken: NaiveDateTime, size: u64, by_month: bool) -> std::io::Result<Option<PathBuf>> {
+    let name = &plain_name(name);
     let dir = if by_month { dest.join(format!("{}", taken.year())).join(taken.format("%m %B").to_string()) } else { dest.to_path_buf() };
     std::fs::create_dir_all(&dir)?;
     let same = dir.join(name);
@@ -529,6 +538,16 @@ mod tests {
         assert!(!f.date_ok(t("2025-01-01")));
         assert!(Filter { from: "2024-13".into(), ..Default::default() }.date_error().is_some());
         assert!(Filter { from: "2025".into(), to: "2024".into(), ..Default::default() }.date_error().is_some());
+    }
+
+    #[test]
+    fn imported_names_stay_inside_the_destination() {
+        assert_eq!(plain_name("../../evil.jpg"), "evil.jpg");
+        assert_eq!(plain_name("a/..\\..\\evil.jpg"), "evil.jpg");
+        assert_eq!(plain_name("/etc/passwd"), "passwd");
+        assert_eq!(plain_name(".."), "unnamed");
+        assert_eq!(plain_name("dir/"), "unnamed");
+        assert_eq!(plain_name("IMG_0001.HEIC"), "IMG_0001.HEIC");
     }
 
     fn run(start: impl FnOnce(Cancel, Reporter)) -> (String, Vec<String>) {
