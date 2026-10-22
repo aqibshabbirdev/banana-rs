@@ -7,6 +7,7 @@ mod duplicates;
 mod imageio;
 mod library;
 mod people;
+mod remote;
 mod store;
 mod thumbs;
 mod transfer;

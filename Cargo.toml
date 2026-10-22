@@ -32,6 +32,13 @@ egui-phosphor = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 trash = "5.2.9"
+rcgen = "0.14.10"
+qrcode = { version = "0.14.1", default-features = false }
+mdns-sd = "0.21.6"
+hmac = "0.12"
+httparse = "1.10.1"
+if-addrs = "0.15.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # HEIC/HEIF/AVIF: macOS uses the built-in ImageIO framework; elsewhere the system libheif
 # (Linux: libheif-dev >= 1.17). Build without it: cargo build --no-default-features
@@ -71,5 +78,6 @@ opt-level = 3
 lto = "thin"
 
 [dev-dependencies]
+rqrr = "0.11.0"
 # Only for examples/make_doc_prompts.rs, which precomputes the Documents prompt embeddings.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }

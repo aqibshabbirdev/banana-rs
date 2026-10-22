@@ -14,6 +14,7 @@ use egui_phosphor::regular as icon;
 use crate::clip;
 use crate::devices::{self, Device};
 use crate::duplicates::{self, DupGroup};
+use crate::remote;
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
@@ -65,6 +66,8 @@ enum Page {
     Duplicates,
     /// A phone or camera plugged in, by index into `devices`.
     Device(usize),
+    /// Pair a phone over the network (QR code), and the phones paired.
+    Connect,
     Recent,
     Archive,
     Albums,
@@ -88,6 +91,7 @@ impl Page {
             Page::Locked => 16,
             Page::Transfer => 17,
             Page::Duplicates => 18,
+            Page::Connect => 19,
             Page::Device(i) => 50 + i,
             Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
@@ -411,6 +415,15 @@ pub struct PhotosApp {
     #[cfg(target_os = "macos")]
     last_ic_poll: f64,
 
+    // Phones over the network (remote.rs): the server while it's on, why it couldn't start,
+    // the QR code shown (pairing code and its picture), what the phones were last sent, and
+    // when to re-scan after uploads stop coming in.
+    remote: Option<remote::Remote>,
+    remote_error: Option<String>,
+    remote_qr: Option<(String, TextureHandle)>,
+    remote_sent: Option<(u64, usize, usize, usize)>,
+    remote_rescan_at: Option<f64>,
+
     transfer: TransferForm,
     transfer_job: Option<TransferJob>,
     /// Summary and per-file errors of the last finished import or export.
@@ -521,6 +534,11 @@ impl PhotosApp {
             image_capture: objc2::MainThreadMarker::new().map(|mtm| devices::mac::ImageCapture::new(mtm, cc.egui_ctx.clone())),
             #[cfg(target_os = "macos")]
             last_ic_poll: 0.0,
+            remote: None,
+            remote_error: None,
+            remote_qr: None,
+            remote_sent: None,
+            remote_rescan_at: None,
             transfer: TransferForm::default(),
             transfer_job: None,
             transfer_result: None,
@@ -545,6 +563,9 @@ impl PhotosApp {
             #[cfg(debug_assertions)]
             debug_trashed: false,
         };
+        if app.store.phones_enabled {
+            app.set_phones_enabled(true, &cc.egui_ctx);
+        }
         let moved = crate::access::restore();
         if let Some(dir) = start.or_else(|| load_last_folder(&moved)).or_else(dirs::picture_dir) {
             app.open_folder(dir, &cc.egui_ctx);
@@ -600,6 +621,8 @@ impl PhotosApp {
         }
         self.vault_notice = None;
         self.notice = None;
+        // Each visit to Connect phone shows a fresh pairing code.
+        self.remote_qr = None;
         self.page = page;
         self.selected.clear();
         self.anchor = None;
@@ -637,6 +660,7 @@ impl PhotosApp {
         self.poll_queries();
         self.poll_duplicates(ctx);
         self.poll_devices(now);
+        self.poll_remote(ctx, now);
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -702,7 +726,7 @@ impl PhotosApp {
                 Page::Videos => !archived && p.is_video,
                 Page::Screenshots => !archived && is_screenshot(&p.path),
                 Page::Archive => archived,
-                Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) => false,
+                Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) | Page::Connect => false,
                 Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                 Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                 Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
@@ -1136,6 +1160,7 @@ impl PhotosApp {
             (icon::ARCHIVE, "Archive", Page::Archive),
             (icon::LOCK_SIMPLE, "Locked Folder", Page::Locked),
             (icon::ARROWS_DOWN_UP, "Import & export", Page::Transfer),
+            (icon::QR_CODE, "Connect phone", Page::Connect),
         ];
         for (ic, label, page) in items {
             let on = self.page == page || (page == Page::People && matches!(self.page, Page::Person(_) | Page::Pets(_)));
@@ -1249,7 +1274,7 @@ impl PhotosApp {
             return;
         }
         let title = match self.page {
-            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) => return,
+            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) | Page::Connect => return,
             Page::Person(i) => {
                 self.person_header(ui, i);
                 return;
@@ -3008,6 +3033,149 @@ impl PhotosApp {
         }
     }
 
+    fn set_phones_enabled(&mut self, on: bool, ctx: &egui::Context) {
+        self.remote = None;
+        self.remote_error = None;
+        self.remote_qr = None;
+        self.remote_sent = None;
+        if on {
+            match remote::Remote::start(ctx.clone()) {
+                Ok(r) => self.remote = Some(r),
+                Err(e) => self.remote_error = Some(e),
+            }
+        }
+        if self.store.phones_enabled != on {
+            self.store.phones_enabled = on;
+            self.store.save();
+        }
+    }
+
+    /// Keeps the phones' view of the library current, and acts on what they did.
+    fn poll_remote(&mut self, ctx: &egui::Context, now: f64) {
+        let Some(r) = &self.remote else { return };
+        let mut favorites_changed = false;
+        while let Ok(e) = r.events.try_recv() {
+            match e {
+                remote::Event::Paired(name) => {
+                    self.notice = Some(format!("{name} is connected. It can now see your library on this network."));
+                    self.remote_qr = None;
+                }
+                // Several photos usually come one after another; scan once they stop.
+                remote::Event::Uploaded => self.remote_rescan_at = Some(now + 3.0),
+                remote::Event::Favorite(path, on) => {
+                    self.store.set_favorite(&path, on);
+                    favorites_changed = true;
+                }
+            }
+        }
+        if favorites_changed {
+            self.view_dirty = true;
+        }
+        if self.remote_rescan_at.is_some_and(|t| now >= t) && !self.scanning && self.transfer_job.is_none() {
+            self.remote_rescan_at = None;
+            if let Some(root) = self.root.clone() {
+                self.open_folder(root, ctx);
+            }
+        }
+        // Send the library again when it changed (cheap check; at most once a second while scanning).
+        let stamp = (self.gen, self.photos.len(), self.store.favorites.len(), self.store.archived.len());
+        if self.remote_sent != Some(stamp) && (!self.scanning || self.photos.is_empty()) {
+            self.remote_sent = Some(stamp);
+            if let Some(r) = &self.remote {
+                r.set_library(remote::snapshot(self.root.clone(), &self.photos, &self.store));
+            }
+        }
+    }
+
+    fn connect_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        ui.label(egui::RichText::new("Connect phone").size(30.0).color(TEXT));
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.set_max_width(820.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "See this library on your phone, and back your phone's photos up to this computer, over your own Wi-Fi. Nothing goes through the internet.",
+                    )
+                    .color(TEXT_DIM),
+                )
+                .wrap(),
+            );
+            ui.add_space(10.0);
+            let mut on = self.remote.is_some();
+            if ui.checkbox(&mut on, "Let phones on this network connect").changed() {
+                self.set_phones_enabled(on, &ctx);
+            }
+            if let Some(e) = &self.remote_error {
+                ui.label(egui::RichText::new(e).color(HEART));
+            }
+            let Some(r) = &self.remote else { return };
+
+            ui.add_space(14.0);
+            if self.remote_qr.is_none() {
+                let code = r.new_pairing_code();
+                let payload = r.qr_payload(&code);
+                if let Some(img) = qr_image(&payload) {
+                    self.remote_qr = Some((payload, ctx.load_texture("pairing-qr", img, TextureOptions::NEAREST)));
+                }
+            }
+            let addresses: Vec<String> = remote::lan_addresses().iter().map(|a| a.to_string()).collect();
+            ui.horizontal(|ui| {
+                if let Some((_, tex)) = &self.remote_qr {
+                    ui.add(egui::Image::from_texture(tex).fit_to_exact_size(vec2(260.0, 260.0)));
+                }
+                ui.add_space(18.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Scan with the Banana Photos app").size(18.0).color(TEXT));
+                    ui.add_space(6.0);
+                    for line in [
+                        "1. Put the phone on the same Wi-Fi as this computer.",
+                        "2. Open Banana Photos on the phone and tap Connect to computer.",
+                        "3. Point it at this code.",
+                    ] {
+                        ui.label(egui::RichText::new(line).color(TEXT_DIM));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("The code works once, for 10 minutes.").color(TEXT_DIM).size(12.5));
+                    if ui.add(egui::Button::new(egui::RichText::new(format!("{}  New code", icon::ARROWS_CLOCKWISE)).color(ACCENT)).frame(false)).clicked() {
+                        self.remote_qr = None;
+                    }
+                    ui.add_space(8.0);
+                    let at = if addresses.is_empty() { "no network found".to_string() } else { addresses.join(", ") };
+                    ui.label(egui::RichText::new(format!("{} · {at} · port {}", r.shared.name, remote::PORT)).color(TEXT_DIM).size(12.5));
+                    if cfg!(target_os = "linux") {
+                        ui.label(
+                            egui::RichText::new(format!("Phone can't connect? Allow the ports in the firewall: sudo ufw allow {}:{}/tcp", remote::PORT, remote::MEDIA_PORT))
+                                .color(TEXT_DIM)
+                                .size(12.5),
+                        );
+                    }
+                });
+            });
+
+            ui.add_space(18.0);
+            ui.label(egui::RichText::new("Connected phones").size(18.0).color(TEXT));
+            let phones = r.phones();
+            if phones.is_empty() {
+                ui.label(egui::RichText::new("None yet.").color(TEXT_DIM));
+            }
+            let mut forget = None;
+            for p in &phones {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{}  {}", icon::DEVICE_MOBILE, p.name)).color(TEXT));
+                    let seen = chrono::DateTime::from_timestamp(p.last_seen, 0).map(|t| t.with_timezone(&Local).format("%b %-d, %H:%M").to_string()).unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("last seen {seen}")).color(TEXT_DIM).size(12.5));
+                    if ui.add(egui::Button::new(egui::RichText::new("Remove").color(HEART)).frame(false)).on_hover_text("It stops working at once; scan again to reconnect").clicked() {
+                        forget = Some(p.key().to_string());
+                    }
+                });
+            }
+            if let Some(k) = forget {
+                r.forget_phone(&k);
+            }
+        });
+    }
+
     fn poll_devices(&mut self, now: f64) {
         let mut latest = None;
         while let Ok(list) = self.devices_rx.try_recv() {
@@ -3827,6 +3995,8 @@ impl eframe::App for PhotosApp {
                         self.locked_page(ui);
                     } else if let Page::Device(i) = self.page {
                         self.device_page(ui, i);
+                    } else if self.page == Page::Connect {
+                        self.connect_page(ui);
                     } else {
                         self.grid(ui);
                     }
@@ -3940,6 +4110,27 @@ fn icon_button(ui: &mut egui::Ui, ic: &str, size: f32, hint: &str) -> egui::Resp
 
 fn make_job(gen: u64, id: usize, p: &Photo) -> Job {
     Job { gen, id, path: p.path.clone(), key: cache_key(&p.path, p.mtime, p.size) }
+}
+
+/// The QR code as an image: black modules on white, with the quiet zone readers need.
+fn qr_image(payload: &str) -> Option<egui::ColorImage> {
+    let code = qrcode::QrCode::new(payload.as_bytes()).ok()?;
+    let (n, quiet, scale) = (code.width(), 4, 6);
+    let colors = code.to_colors();
+    let side = (n + 2 * quiet) * scale;
+    let mut img = egui::ColorImage::new([side, side], Color32::WHITE);
+    for y in 0..n {
+        for x in 0..n {
+            if colors[y * n + x] == qrcode::Color::Dark {
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        img[((x + quiet) * scale + dx, (y + quiet) * scale + dy)] = Color32::BLACK;
+                    }
+                }
+            }
+        }
+    }
+    Some(img)
 }
 
 /// "Keep" pill in the bottom-right corner of the photo suggested to keep on Duplicates.
@@ -4133,6 +4324,11 @@ impl PhotosApp {
                 Some("recent") => self.set_page(Page::Recent),
                 Some("screenshots") => self.set_page(Page::Screenshots),
                 Some("duplicates") => self.set_page(Page::Duplicates),
+                // BANANA_PAGE=connect turns phone connections on (in this data folder) and shows the QR code.
+                Some("connect") => {
+                    self.set_phones_enabled(true, ctx);
+                    self.set_page(Page::Connect);
+                }
                 // BANANA_PAGE=device0, and BANANA_DEVICE_IMPORT=1 (with BANANA_DEVICE_PICTURES=1) to import from it.
                 Some(p) if p.starts_with("device") => {
                     let i = p[6..].parse().unwrap_or(0);
@@ -4220,4 +4416,21 @@ fn linked_elsewhere(path: &Path) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pairing QR code reads back as exactly the link the phone needs.
+    #[test]
+    fn qr_code_reads_back() {
+        let payload = "bananaphotos://pair?v=1&n=Aqib%27s%20PC&h=192.168.1.5%2C10.0.0.2&p=47820&m=47821&c=0123456789abcdef&f=".to_string() + &"ab".repeat(32);
+        let img = qr_image(&payload).unwrap();
+        let gray = image::GrayImage::from_fn(img.size[0] as u32, img.size[1] as u32, |x, y| image::Luma([img[(x as usize, y as usize)].r()]));
+        let mut prepared = rqrr::PreparedImage::prepare(gray);
+        let grids = prepared.detect_grids();
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].decode().unwrap().1, payload);
+    }
 }

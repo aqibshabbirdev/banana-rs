@@ -67,7 +67,7 @@ fn base64url(bytes: &[u8]) -> String {
     out
 }
 
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
@@ -76,7 +76,7 @@ fn encode(s: &str) -> String {
         .collect()
 }
 
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -366,5 +366,7 @@ mod tests {
     fn url_encoding_round_trips() {
         let s = "http://127.0.0.1:5000/?a=b c&d=é";
         assert_eq!(decode(&encode(s)), s);
+        // An escape right at the end decodes too.
+        assert_eq!(decode("a%41"), "aA");
     }
 }

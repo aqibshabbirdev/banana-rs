@@ -28,6 +28,9 @@ pub struct Store {
     /// Faces of people the user hid from People & pets.
     #[serde(default)]
     pub hidden_faces: HashSet<String>,
+    /// Phones on this network may connect (Connect phone).
+    #[serde(default)]
+    pub phones_enabled: bool,
     /// Folders of imports kept apart: their photos stay out of the Photos timeline and show
     /// in their own album.
     #[serde(default)]
@@ -51,6 +54,15 @@ impl Store {
     }
 
     /// Sets every path to favourite, unless all already are, in which case it clears them.
+    pub fn set_favorite(&mut self, path: &Path, on: bool) {
+        if on {
+            self.favorites.insert(path.to_path_buf());
+        } else {
+            self.favorites.remove(path);
+        }
+        self.save();
+    }
+
     pub fn toggle_favorites(&mut self, paths: &[PathBuf]) {
         if paths.iter().all(|p| self.favorites.contains(p)) {
             for p in paths {

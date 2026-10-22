@@ -174,6 +174,18 @@ pub fn thumbnail_jpeg(path: &Path) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The grid thumbnail as JPEG, from the cache (made and cached now if it isn't there yet).
+pub fn cached_thumb_jpeg(path: &Path, mtime: u64, size: u64) -> Option<Vec<u8>> {
+    let cached = cache_dir().join(format!("{:016x}.jpg", cache_key(path, mtime, size)));
+    if let Ok(b) = std::fs::read(&cached) {
+        return Some(b);
+    }
+    let jpeg = thumbnail_jpeg(path)?;
+    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::write(&cached, &jpeg);
+    Some(jpeg)
+}
+
 /// Removes the cached thumbnail of a photo (when it moves into Locked Folder).
 pub fn forget_cached(path: &Path, mtime: u64, size: u64) {
     let _ = std::fs::remove_file(cache_dir().join(format!("{:016x}.jpg", cache_key(path, mtime, size))));
