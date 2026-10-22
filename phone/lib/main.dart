@@ -44,6 +44,9 @@ class _BananaAppState extends State<BananaApp> {
     if (uri != null && uri.scheme == 'bananaphotos') setState(() => _link = uri.toString());
   }
 
+  /// After a failed pairing the same link may come again (scanned twice): let it through.
+  void _clearLink() => _link = null;
+
   @override
   void dispose() {
     _links?.cancel();
@@ -67,6 +70,7 @@ class _BananaAppState extends State<BananaApp> {
           _link = null;
         }),
         onCancel: _pairing == null ? null : () => setState(() => _link = null),
+        onFailed: _clearLink,
       );
     } else {
       home = HomeScreen(

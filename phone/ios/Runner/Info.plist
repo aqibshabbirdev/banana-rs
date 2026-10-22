@@ -13,6 +13,9 @@
 			</array>
 		</dict>
 	</array>
+	<!-- Pairing links go to app_links (lib/main.dart), not Flutter's own router. -->
+	<key>FlutterDeepLinkingEnabled</key>
+	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>To scan the code on your computer that connects this phone to Banana Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

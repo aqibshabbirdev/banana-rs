@@ -10,12 +10,15 @@ import '../api.dart';
 import '../main.dart' show banana;
 
 class ConnectScreen extends StatefulWidget {
-  const ConnectScreen({super.key, this.link, required this.onPaired, this.onCancel});
+  const ConnectScreen({super.key, this.link, required this.onPaired, this.onCancel, this.onFailed});
 
   /// A pairing link to use right away (opened from the camera app).
   final String? link;
   final void Function(Pairing) onPaired;
   final VoidCallback? onCancel;
+
+  /// Pairing with [link] failed, so the same link may be tried again.
+  final VoidCallback? onFailed;
 
   @override
   State<ConnectScreen> createState() => _ConnectScreenState();
@@ -30,6 +33,14 @@ class _ConnectScreenState extends State<ConnectScreen> {
   void initState() {
     super.initState();
     if (widget.link != null) WidgetsBinding.instance.addPostFrameCallback((_) => _pair(widget.link!));
+  }
+
+  /// A new link while this screen is up (the first code had expired and a new one was scanned).
+  @override
+  void didUpdateWidget(ConnectScreen old) {
+    super.didUpdateWidget(old);
+    final link = widget.link;
+    if (link != null && link != old.link && !_busy) _pair(link);
   }
 
   Future<String> _phoneName() async {
@@ -60,6 +71,7 @@ class _ConnectScreenState extends State<ConnectScreen> {
       widget.onPaired(paired);
     } catch (e) {
       setState(() => _error = '$e');
+      widget.onFailed?.call();
     } finally {
       if (mounted) setState(() => _busy = false);
     }

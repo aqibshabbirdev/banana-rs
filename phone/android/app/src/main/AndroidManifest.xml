@@ -39,6 +39,8 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- Pairing links go to app_links (lib/main.dart), not Flutter's own router. -->
+            <meta-data android:name="flutter_deeplinking_enabled" android:value="false"/>
             <!-- The pairing QR code's link, when the phone's camera app scans it. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW"/>
