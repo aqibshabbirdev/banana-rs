@@ -183,6 +183,8 @@ flutter build apk --release        # Android: build/app/outputs/flutter-apk/app-
 flutter build ios --release        # iOS (needs signing in Xcode)
 ```
 
+Release APKs are signed with the key that `phone/android/key.properties` points at (not in git; the keystore is kept in `~/.banana-photos/`). Keep a backup of both: Android only installs an update signed with the same key. Without `key.properties` release builds use the debug key. `--split-per-abi` makes one smaller APK per CPU (arm64 is the one for current phones).
+
 Android builds need a JDK 17 (`JAVA_HOME`; Android Studio's, or the OpenJDK Unity ships under `PlaybackEngines/AndroidPlayer/OpenJDK`). The iOS project builds the simulator app for arm64 only, because Flutter's architecture check trips over Xcode 27's `lipo` when it's asked for two at once.
 
 To try the phone app against a desktop build without opening its window, a debug build with `BANANA_PHONES=1` turns Connect phone on at launch and prints the pairing link to stderr.
