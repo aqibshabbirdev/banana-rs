@@ -228,24 +228,24 @@ pub fn rank<'a>(query: &[f32], candidates: impl Iterator<Item = (usize, &'a Stor
 }
 
 #[cfg(unix)]
-fn path_bytes(p: &Path) -> &[u8] {
+pub(crate) fn path_bytes(p: &Path) -> &[u8] {
     use std::os::unix::ffi::OsStrExt;
     p.as_os_str().as_bytes()
 }
 
 #[cfg(unix)]
-fn path_from(b: &[u8]) -> PathBuf {
+pub(crate) fn path_from(b: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     PathBuf::from(std::ffi::OsStr::from_bytes(b))
 }
 
 #[cfg(not(unix))]
-fn path_bytes(p: &Path) -> &[u8] {
+pub(crate) fn path_bytes(p: &Path) -> &[u8] {
     p.to_str().unwrap_or_default().as_bytes()
 }
 
 #[cfg(not(unix))]
-fn path_from(b: &[u8]) -> PathBuf {
+pub(crate) fn path_from(b: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(b).into_owned())
 }
 

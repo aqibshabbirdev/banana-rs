@@ -1,7 +1,8 @@
 //! Finding photos on disk and working out when each one was taken.
 
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::UNIX_EPOCH;
@@ -16,6 +17,7 @@ const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "hif", "avif"];
 #[cfg(not(any(target_os = "macos", feature = "heic")))]
 const HEIF_EXTENSIONS: &[&str] = &[];
 
+#[derive(Clone)]
 pub struct Photo {
     pub path: PathBuf,
     pub taken: NaiveDateTime,
@@ -49,8 +51,12 @@ pub fn is_image(path: &Path) -> bool {
 }
 
 /// Walks `root` on a background thread and streams photos back in batches tagged with `gen`.
+/// What each photo's date, shape and length are comes from the last scan (`scan.bin`) when the
+/// file hasn't changed since; only new and changed files are opened, which on a big library
+/// (and for videos, which have to be probed) is most of the time a launch would take.
 pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let paths: Vec<PathBuf> = WalkDir::new(&root)
             .follow_links(true)
             .into_iter()
@@ -63,15 +69,125 @@ pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egu
         let _ = tx.send(ScanMsg::Total(gen, paths.len()));
         ctx.request_repaint();
 
-        paths.par_chunks(200).for_each(|chunk| {
-            let photos: Vec<Photo> = chunk.iter().filter_map(|p| read_photo(p)).collect();
-            let _ = tx.send(ScanMsg::Batch(gen, photos));
-            ctx.request_repaint();
-        });
+        let cache = ScanCache::load();
+        let reread = std::sync::atomic::AtomicUsize::new(0);
+        let found: Vec<Photo> = paths
+            .par_chunks(200)
+            .flat_map_iter(|chunk| {
+                let photos: Vec<Photo> = chunk
+                    .iter()
+                    .filter_map(|p| {
+                        cache.get(p).or_else(|| {
+                            reread.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            read_photo(p)
+                        })
+                    })
+                    .collect();
+                let _ = tx.send(ScanMsg::Batch(gen, photos.clone()));
+                ctx.request_repaint();
+                photos
+            })
+            .collect();
 
+        let reread = reread.into_inner();
         let _ = tx.send(ScanMsg::Done(gen));
         ctx.request_repaint();
+        if std::env::var_os("BANANA_SCAN_TIMING").is_some() {
+            eprintln!("scan: {} files, {reread} read, {:?}", paths.len(), started.elapsed());
+        }
+        cache.update(&root, found, reread > 0);
     });
+}
+
+/// What the last scans found, saved as `scan.bin` in the data folder: per file its modified
+/// time and size (to tell it hasn't changed), and what reading it gave.
+/// File: b"BSCAN\0\0\x01", count u32, then per photo: path length u32, path bytes, mtime u64,
+/// size u64, taken i64 (seconds, as local wall-clock time), from_exif u8, aspect f32, is_video u8,
+/// duration f32 (NaN: unknown). Little-endian.
+pub struct ScanCache {
+    entries: HashMap<PathBuf, Photo>,
+}
+
+const SCAN_MAGIC: &[u8; 8] = b"BSCAN\0\0\x01";
+
+impl ScanCache {
+    fn file() -> Option<PathBuf> {
+        Some(crate::store::data_dir()?.join("scan.bin"))
+    }
+
+    pub fn load() -> Self {
+        let entries = Self::file().and_then(|f| std::fs::read(f).ok()).and_then(|b| decode_scan(&b)).unwrap_or_default();
+        Self { entries }
+    }
+
+    /// The photo as last read, if the file at `path` still has the same modified time and size.
+    pub fn get(&self, path: &Path) -> Option<Photo> {
+        let p = self.entries.get(path)?;
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        (mtime == p.mtime && meta.len() == p.size).then(|| p.clone())
+    }
+
+    /// Replaces what's known under `root` with this scan's photos (dropping files that are gone)
+    /// and saves, if anything changed. Entries for other folders stay for when they're opened.
+    fn update(mut self, root: &Path, found: Vec<Photo>, reread: bool) {
+        let before = self.entries.len();
+        self.entries.retain(|p, _| !p.starts_with(root));
+        let removed = before - self.entries.len() != found.len();
+        self.entries.extend(found.into_iter().map(|p| (p.path.clone(), p)));
+        if reread || removed {
+            if let Some(f) = Self::file() {
+                crate::store::write_atomic(&f, &encode_scan(&self.entries));
+            }
+        }
+    }
+}
+
+fn encode_scan(entries: &HashMap<PathBuf, Photo>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + entries.len() * 120);
+    out.extend_from_slice(SCAN_MAGIC);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for p in entries.values() {
+        let path = crate::clip::path_bytes(&p.path);
+        out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        out.extend_from_slice(path);
+        out.extend_from_slice(&p.mtime.to_le_bytes());
+        out.extend_from_slice(&p.size.to_le_bytes());
+        out.extend_from_slice(&p.taken.and_utc().timestamp().to_le_bytes());
+        out.push(p.from_exif as u8);
+        out.extend_from_slice(&p.aspect.to_le_bytes());
+        out.push(p.is_video as u8);
+        out.extend_from_slice(&p.duration.unwrap_or(f32::NAN).to_le_bytes());
+    }
+    out
+}
+
+fn decode_scan(mut b: &[u8]) -> Option<HashMap<PathBuf, Photo>> {
+    fn take<const N: usize>(b: &mut &[u8]) -> Option<[u8; N]> {
+        let mut a = [0; N];
+        b.read_exact(&mut a).ok()?;
+        Some(a)
+    }
+    if take::<8>(&mut b)? != *SCAN_MAGIC {
+        return None;
+    }
+    let n = u32::from_le_bytes(take(&mut b)?) as usize;
+    let mut out = HashMap::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        let len = u32::from_le_bytes(take(&mut b)?) as usize;
+        let path = crate::clip::path_from(b.get(..len)?);
+        b = &b[len..];
+        let mtime = u64::from_le_bytes(take(&mut b)?);
+        let size = u64::from_le_bytes(take(&mut b)?);
+        let taken = DateTime::from_timestamp(i64::from_le_bytes(take(&mut b)?), 0)?.naive_utc();
+        let from_exif = take::<1>(&mut b)?[0] != 0;
+        let aspect = f32::from_le_bytes(take(&mut b)?);
+        let is_video = take::<1>(&mut b)?[0] != 0;
+        let duration = Some(f32::from_le_bytes(take(&mut b)?)).filter(|d| !d.is_nan());
+        let added = DateTime::from_timestamp(mtime as i64, 0)?.with_timezone(&Local).naive_local();
+        out.insert(path.clone(), Photo { path, taken, from_exif, mtime, size, added, aspect, is_video, duration });
+    }
+    Some(out)
 }
 
 pub fn read_photo(path: &Path) -> Option<Photo> {
@@ -183,4 +299,61 @@ fn exif_date(exif: &exif::Exif) -> Option<NaiveDateTime> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn photo(path: &Path, aspect: f32) -> Photo {
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let taken = NaiveDate::from_ymd_opt(2024, 5, 17).unwrap().and_hms_opt(10, 30, 0).unwrap();
+        let added = DateTime::from_timestamp(mtime as i64, 0).unwrap().with_timezone(&Local).naive_local();
+        Photo { path: path.to_path_buf(), taken, from_exif: true, mtime, size: meta.len(), added, aspect, is_video: false, duration: None }
+    }
+
+    #[test]
+    fn scan_cache_round_trips_and_skips_only_unchanged_files() {
+        let dir = std::env::temp_dir().join(format!("banana-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (same, changed) = (dir.join("same.jpg"), dir.join("changed.jpg"));
+        std::fs::write(&same, b"not really a jpeg").unwrap();
+        std::fs::write(&changed, b"old").unwrap();
+
+        let mut video = photo(&same, 1.5);
+        video.path = dir.join("clip.mp4");
+        video.is_video = true;
+        video.duration = Some(12.5);
+        let entries: HashMap<PathBuf, Photo> =
+            [photo(&same, 1.5), photo(&changed, 0.75), video].into_iter().map(|p| (p.path.clone(), p)).collect();
+        let decoded = decode_scan(&encode_scan(&entries)).unwrap();
+        assert_eq!(decoded.len(), 3);
+        let v = &decoded[&dir.join("clip.mp4")];
+        assert!(v.is_video && v.duration == Some(12.5) && v.taken == entries[&dir.join("clip.mp4")].taken && v.from_exif);
+        assert_eq!(decoded[&same].duration, None);
+
+        // A file that changed size since the scan is read again; an untouched one is not.
+        std::fs::write(&changed, b"new and longer").unwrap();
+        let cache = ScanCache { entries: decoded };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(cache.get(&changed).is_none());
+        assert!(cache.get(&dir.join("clip.mp4")).is_none(), "a file that's gone isn't served from the cache");
+        assert!(decode_scan(b"BSCAN\0\0\x02\0\0\0\0").is_none(), "another version is ignored");
+    }
+
+    #[test]
+    fn unchanged_file_comes_from_the_cache() {
+        let dir = std::env::temp_dir().join(format!("banana-scan2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.jpg");
+        std::fs::write(&f, b"x").unwrap();
+        // An aspect no real read would give, to tell the cached entry apart.
+        let cache = ScanCache { entries: [(f.clone(), photo(&f, 7.0))].into_iter().collect() };
+        let got = cache.get(&f).map(|p| p.aspect);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Some(7.0));
+    }
 }
