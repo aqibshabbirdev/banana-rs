@@ -1,9 +1,13 @@
 // The computer's library as the phone holds it: the timeline (newest first), grouped by day,
-// refreshed when the computer says it changed.
+// refreshed when the computer says it changed. It's also saved on the phone, so the app opens
+// on the last timeline it saw even when the computer is off (thumbnails come from the cache).
 
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 import 'api.dart';
 
@@ -69,9 +73,8 @@ class Library extends ChangeNotifier {
       final info = await api.info();
       if (force || info['library_version'] != version) {
         final got = await api.photos();
-        items = got.items.map(Item.fromJson).toList();
-        byId = {for (final i in items) i.id: i};
-        version = got.version;
+        _set(got.items, got.version);
+        unawaited(_save(got.items, got.version));
       }
     } catch (e) {
       error = e;
@@ -79,6 +82,44 @@ class Library extends ChangeNotifier {
       loading = false;
       notifyListeners();
     }
+  }
+
+  void _set(List<Map<String, dynamic>> raw, int v) {
+    items = raw.map(Item.fromJson).toList();
+    byId = {for (final i in items) i.id: i};
+    version = v;
+  }
+
+  Future<File> _file() async =>
+      File('${(await getApplicationSupportDirectory()).path}/library-${api.pairing.fingerprint.substring(0, 12)}.json');
+
+  /// The timeline saved the last time the computer was reached, if any.
+  Future<void> loadSaved() async {
+    try {
+      final j = jsonDecode(await (await _file()).readAsString()) as Map<String, dynamic>;
+      if (items.isEmpty) {
+        _set((j['items'] as List).cast<Map<String, dynamic>>(), j['version'] as int);
+        notifyListeners();
+      }
+    } catch (_) {
+      // Nothing saved yet, or from an older app: wait for the computer.
+    }
+  }
+
+  Future<void> _save(List<Map<String, dynamic>> raw, int v) async {
+    try {
+      final f = await _file();
+      final tmp = File('${f.path}.tmp');
+      await tmp.writeAsString(jsonEncode({'version': v, 'items': raw}));
+      await tmp.rename(f.path);
+    } catch (_) {}
+  }
+
+  /// Removes the saved timeline (when the phone is unpaired).
+  Future<void> forgetSaved() async {
+    try {
+      await (await _file()).delete();
+    } catch (_) {}
   }
 
   /// Checks for changes every 30 seconds while the app is open.

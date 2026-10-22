@@ -1,5 +1,7 @@
 // The main screen once paired: the computer's photos, search, and backing this phone up.
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 
@@ -29,29 +31,49 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   late final CacheManager cache = CacheManager(Config('banana-${widget.pairing.fingerprint.substring(0, 12)}',
       stalePeriod: const Duration(days: 60), maxNrOfCacheObjects: 40000, fileService: HttpFileService(httpClient: api.client)));
   int _tab = 0;
+
+  /// Not connected yet: "Connecting…", or why the computer can't be reached. Null once connected.
   String? _status = 'Connecting…';
+  bool _connecting = false;
+
+  /// While the computer can't be reached, try again now and then, so the phone connects by
+  /// itself once Banana Photos is opened there.
+  Timer? _retry;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     library.addListener(_onLibrary);
+    library.loadSaved();
     _connect();
   }
 
   Future<void> _connect() async {
+    if (_connecting) return;
+    _connecting = true;
+    _retry?.cancel();
     setState(() => _status = 'Connecting to ${widget.pairing.name}…');
     try {
       await api.connect();
+      if (!mounted) return;
       setState(() => _status = null);
       await library.refresh(force: true);
       library.startPolling();
     } on ApiException catch (e) {
       if (e.unpaired) return _unpaired();
-      setState(() => _status = e.message);
+      _offline(e.message);
     } catch (e) {
-      setState(() => _status = '$e');
+      _offline('$e');
+    } finally {
+      _connecting = false;
     }
+  }
+
+  void _offline(String why) {
+    if (!mounted) return;
+    setState(() => _status = why);
+    _retry = Timer(const Duration(seconds: 20), _connect);
   }
 
   void _onLibrary() {
@@ -61,6 +83,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _unpaired() async {
     if (!mounted) return;
+    await library.forgetSaved();
     await widget.onUnpaired('${widget.pairing.name} removed this phone. Scan the code on the computer again to reconnect.');
   }
 
@@ -71,12 +94,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       library.startPolling();
     } else if (state == AppLifecycleState.paused) {
       library.stopPolling();
+      _retry?.cancel();
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _retry?.cancel();
     library.removeListener(_onLibrary);
     library.dispose();
     api.close();
@@ -97,6 +122,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     if (ok == true) {
       await cache.emptyCache();
+      await library.forgetSaved();
       await widget.onUnpaired(null);
     }
   }
@@ -119,22 +145,56 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ],
       ),
-      body: _status != null
-          ? Center(
+      body: ListenableBuilder(
+        listenable: library,
+        builder: (context, _) {
+          final status = _status;
+          final waiting = status != null && status.endsWith('…');
+          // Nothing saved to show yet: the whole screen is about connecting.
+          if (status != null && library.items.isEmpty) {
+            return Center(
               child: Padding(
                 padding: const EdgeInsets.all(32),
                 child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  if (_status!.endsWith('…')) const CircularProgressIndicator() else const Icon(Icons.wifi_off, size: 48),
+                  if (waiting) const CircularProgressIndicator() else const Icon(Icons.wifi_off, size: 48),
                   const SizedBox(height: 16),
-                  Text(_status!, textAlign: TextAlign.center),
-                  if (!_status!.endsWith('…')) ...[
+                  Text(status, textAlign: TextAlign.center),
+                  if (!waiting) ...[
                     const SizedBox(height: 16),
                     FilledButton(onPressed: _connect, child: const Text('Try again')),
                   ],
                 ]),
               ),
-            )
-          : IndexedStack(index: _tab, children: pages),
+            );
+          }
+          final tabs = IndexedStack(index: _tab, children: pages);
+          if (status == null) return tabs;
+          // The saved timeline, with a strip saying it isn't connected (yet).
+          return Column(children: [
+            Material(
+              color: waiting ? Theme.of(context).colorScheme.surfaceContainerHigh : Theme.of(context).colorScheme.errorContainer,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+                child: Row(children: [
+                  if (waiting)
+                    const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                  else
+                    const Icon(Icons.wifi_off, size: 18),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      waiting ? 'Connecting to ${widget.pairing.name}… · showing saved photos' : "Can't reach ${widget.pairing.name} · showing saved photos. Is Banana Photos open there?",
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ),
+                  if (!waiting) TextButton(onPressed: _connect, child: const Text('Retry')),
+                ]),
+              ),
+            ),
+            Expanded(child: tabs),
+          ]);
+        },
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _tab,
         onDestinationSelected: (i) => setState(() => _tab = i),
