@@ -1,5 +1,8 @@
 // One photo or video at a time: swipe between them, pinch to zoom, play videos, favourite.
 
+import 'dart:async';
+import 'dart:io';
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
@@ -77,8 +80,9 @@ class _ViewerState extends State<Viewer> {
   }
 }
 
-/// The photo at screen size, zoomable; the thumbnail shows while it loads.
-class PhotoPage extends StatelessWidget {
+/// The photo at screen size, zoomable. The thumbnail shows, with a spinner, while it loads and
+/// while the computer can't be reached; then it tries again by itself every few seconds.
+class PhotoPage extends StatefulWidget {
   const PhotoPage({super.key, required this.item, required this.api, required this.cache});
 
   final Item item;
@@ -86,23 +90,85 @@ class PhotoPage extends StatelessWidget {
   final CacheManager cache;
 
   @override
+  State<PhotoPage> createState() => _PhotoPageState();
+}
+
+/// How long to wait before asking the computer again for something that didn't load.
+const retryAfter = Duration(seconds: 4);
+
+class _PhotoPageState extends State<PhotoPage> {
+  int _attempt = 0;
+  Timer? _retry;
+
+  @override
+  void dispose() {
+    _retry?.cancel();
+    super.dispose();
+  }
+
+  void _retryLater(String url, String key) {
+    _retry ??= Timer(retryAfter, () async {
+      await CachedNetworkImage.evictFromCache(url, cacheKey: key, cacheManager: widget.cache);
+      if (mounted) {
+        setState(() {
+          _retry = null;
+          _attempt++;
+        });
+      }
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final item = widget.item, api = widget.api;
     final px = (MediaQuery.sizeOf(context).longestSide * MediaQuery.devicePixelRatioOf(context)).round().clamp(1024, 4096);
-    Widget thumb() => CachedNetworkImage(imageUrl: api.thumbUrl(item.id), cacheKey: 't-${item.id}', httpHeaders: api.headers, cacheManager: cache, fit: BoxFit.contain);
+    final url = api.photoUrl(item.id, max: px), key = 'p$px-${item.id}';
+    Widget waiting() => ThumbWithSpinner(item: item, api: api, cache: widget.cache);
     return InteractiveViewer(
       maxScale: 6,
       child: Center(
         child: CachedNetworkImage(
-          imageUrl: api.photoUrl(item.id, max: px),
-          cacheKey: 'p$px-${item.id}',
+          key: ValueKey('$key#$_attempt'),
+          imageUrl: url,
+          cacheKey: key,
+          httpHeaders: api.headers,
+          cacheManager: widget.cache,
+          fit: BoxFit.contain,
+          fadeInDuration: Duration.zero,
+          placeholder: (_, _) => waiting(),
+          errorWidget: (_, _, _) {
+            _retryLater(url, key);
+            return waiting();
+          },
+        ),
+      ),
+    );
+  }
+}
+
+/// The cached thumbnail, full screen, with a spinner on top.
+class ThumbWithSpinner extends StatelessWidget {
+  const ThumbWithSpinner({super.key, required this.item, required this.api, required this.cache});
+
+  final Item item;
+  final Api api;
+  final CacheManager cache;
+
+  @override
+  Widget build(BuildContext context) {
+    // Fills the page (it may sit in a Center, which would shrink it to the spinner).
+    return SizedBox.expand(
+      child: Stack(fit: StackFit.expand, children: [
+        CachedNetworkImage(
+          imageUrl: api.thumbUrl(item.id),
+          cacheKey: 't-${item.id}',
           httpHeaders: api.headers,
           cacheManager: cache,
           fit: BoxFit.contain,
-          fadeInDuration: Duration.zero,
-          placeholder: (_, _) => Stack(alignment: Alignment.center, children: [thumb(), const CircularProgressIndicator()]),
-          errorWidget: (_, _, e) => Center(child: Text("Couldn't load this photo.\n$e", textAlign: TextAlign.center)),
+          errorWidget: (_, _, _) => const SizedBox(),
         ),
-      ),
+        const Center(child: CircularProgressIndicator()),
+      ]),
     );
   }
 }
@@ -124,7 +190,10 @@ class VideoPage extends StatefulWidget {
 
 class _VideoPageState extends State<VideoPage> {
   VideoPlayerController? _video;
-  Object? _error;
+
+  /// The computer answers but this phone can't play the video (its format).
+  bool _unplayable = false;
+  Timer? _retry;
 
   @override
   void initState() {
@@ -135,26 +204,56 @@ class _VideoPageState extends State<VideoPage> {
   @override
   void didUpdateWidget(VideoPage old) {
     super.didUpdateWidget(old);
-    if (widget.active && _video == null && _error == null) _start();
+    if (widget.active && _video == null && _retry == null && !_unplayable) _start();
     if (!widget.active) _video?.pause();
   }
 
   Future<void> _start() async {
+    _retry = null;
+    VideoPlayerController? v;
+    String? url;
     try {
-      final url = await widget.api.mediaUrl(widget.item.id);
-      final v = VideoPlayerController.networkUrl(Uri.parse(url));
-      _video = v;
+      url = await widget.api.mediaUrl(widget.item.id);
+      v = VideoPlayerController.networkUrl(Uri.parse(url));
       await v.initialize();
+      if (!mounted) return v.dispose();
+      _video = v;
       v.addListener(() => mounted ? setState(() {}) : null);
       if (widget.active) await v.play();
-      if (mounted) setState(() {});
-    } catch (e) {
-      if (mounted) setState(() => _error = e);
+      setState(() {});
+    } catch (_) {
+      await v?.dispose();
+      if (!mounted) return;
+      // The player failed although the computer serves the file: the phone can't decode it.
+      // Anything else (computer off, or just started and still scanning): wait and try again.
+      if (url != null && await _serves(url)) {
+        if (mounted) setState(() => _unplayable = true);
+      } else if (mounted) {
+        _retry = Timer(retryAfter, _start);
+        setState(() {});
+      }
+    }
+  }
+
+  /// Whether the media link answers with the video's first bytes.
+  static Future<bool> _serves(String url) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
+    try {
+      final req = await client.getUrl(Uri.parse(url));
+      req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-1');
+      final resp = await req.close().timeout(const Duration(seconds: 6));
+      await resp.drain<void>();
+      return resp.statusCode == 206 || resp.statusCode == 200;
+    } catch (_) {
+      return false;
+    } finally {
+      client.close(force: true);
     }
   }
 
   @override
   void dispose() {
+    _retry?.cancel();
     _video?.dispose();
     super.dispose();
   }
@@ -162,12 +261,19 @@ class _VideoPageState extends State<VideoPage> {
   @override
   Widget build(BuildContext context) {
     final v = _video;
-    if (_error != null) return Center(child: Text("Couldn't play this video.\n$_error", textAlign: TextAlign.center));
-    if (v == null || !v.value.isInitialized) {
+    if (_unplayable) {
       return Stack(alignment: Alignment.center, children: [
-        CachedNetworkImage(imageUrl: widget.api.thumbUrl(widget.item.id), cacheKey: 't-${widget.item.id}', httpHeaders: widget.api.headers, cacheManager: widget.cache),
-        const CircularProgressIndicator(),
+        Positioned.fill(child: Opacity(opacity: 0.35, child: ThumbWithSpinner(item: widget.item, api: widget.api, cache: widget.cache))),
+        Container(
+          margin: const EdgeInsets.all(32),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(14)),
+          child: const Text("This phone can't play this video's format.\nOpen it on the computer instead.", textAlign: TextAlign.center),
+        ),
       ]);
+    }
+    if (v == null || !v.value.isInitialized) {
+      return ThumbWithSpinner(item: widget.item, api: widget.api, cache: widget.cache);
     }
     final pos = v.value.position, len = v.value.duration;
     return Stack(children: [
