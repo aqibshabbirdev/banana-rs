@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Videos play from the computer's media port over plain HTTP, through links signed for one
+     file that expire (docs/phone-api.md); everything else is HTTPS pinned to the computer's
+     certificate in code. Android can't scope cleartext to private addresses, so it's allowed. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true"/>
+</network-security-config>

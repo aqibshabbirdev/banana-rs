@@ -566,6 +566,15 @@ impl PhotosApp {
         if app.store.phones_enabled {
             app.set_phones_enabled(true, &cc.egui_ctx);
         }
+        // Dev only: BANANA_PHONES=1 turns Connect phone on and opens it, and the pairing link
+        // goes to stderr, for testing the phone app against a headless build.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("BANANA_PHONES").is_some() {
+            if app.remote.is_none() {
+                app.set_phones_enabled(true, &cc.egui_ctx);
+            }
+            app.page = Page::Connect;
+        }
         let moved = crate::access::restore();
         if let Some(dir) = start.or_else(|| load_last_folder(&moved)).or_else(dirs::picture_dir) {
             app.open_folder(dir, &cc.egui_ctx);
@@ -3071,10 +3080,15 @@ impl PhotosApp {
         if favorites_changed {
             self.view_dirty = true;
         }
-        if self.remote_rescan_at.is_some_and(|t| now >= t) && !self.scanning && self.transfer_job.is_none() {
-            self.remote_rescan_at = None;
-            if let Some(root) = self.root.clone() {
-                self.open_folder(root, ctx);
+        if let Some(t) = self.remote_rescan_at {
+            if now >= t && !self.scanning && self.transfer_job.is_none() {
+                self.remote_rescan_at = None;
+                if let Some(root) = self.root.clone() {
+                    self.open_folder(root, ctx);
+                }
+            } else {
+                // Nothing else may wake the app (nobody at the computer), so ask to be woken.
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.5)));
             }
         }
         // Send the library again when it changed (cheap check; at most once a second while scanning).
@@ -3115,6 +3129,10 @@ impl PhotosApp {
             if self.remote_qr.is_none() {
                 let code = r.new_pairing_code();
                 let payload = r.qr_payload(&code);
+                #[cfg(debug_assertions)]
+                if std::env::var_os("BANANA_PHONES").is_some() {
+                    eprintln!("pairing link: {payload}");
+                }
                 if let Some(img) = qr_image(&payload) {
                     self.remote_qr = Some((payload, ctx.load_texture("pairing-qr", img, TextureOptions::NEAREST)));
                 }

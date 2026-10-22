@@ -172,6 +172,21 @@ With no folder it opens the last folder you used, or your Pictures folder.
 | `src/duplicates.rs` | Exact copies and similar shots, and the Trash |
 | `src/app.rs` | The egui UI: sidebar, justified timeline, memories, albums, viewer, dialogs |
 
+## Phone app
+
+`phone/` is the phone app (Flutter, Android and iOS) for **Connect phone**: it pairs by scanning the QR code (or opening its `bananaphotos://pair` link from the camera app), shows the computer's timeline, opens photos and videos, searches with the computer's AI, favourites, and backs the phone's photos up to the computer. It talks to the API in [docs/phone-api.md](docs/phone-api.md) and trusts only the paired computer's certificate.
+
+```bash
+cd phone
+flutter test
+flutter build apk --release        # Android: build/app/outputs/flutter-apk/app-release.apk
+flutter build ios --release        # iOS (needs signing in Xcode)
+```
+
+Android builds need a JDK 17 (`JAVA_HOME`; Android Studio's, or the OpenJDK Unity ships under `PlaybackEngines/AndroidPlayer/OpenJDK`). The iOS project builds the simulator app for arm64 only, because Flutter's architecture check trips over Xcode 27's `lipo` when it's asked for two at once.
+
+To try the phone app against a desktop build without opening its window, a debug build with `BANANA_PHONES=1` turns Connect phone on at launch and prints the pairing link to stderr.
+
 ## License
 
 MIT, see [LICENSE](LICENSE). The AI models it downloads keep their own licenses (MIT and Apache-2.0, listed above).

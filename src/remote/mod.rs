@@ -174,6 +174,8 @@ impl Shared {
 pub struct Remote {
     pub shared: Arc<Shared>,
     stop: Arc<AtomicBool>,
+    /// The listening threads; waited for on drop, so the ports are free again right away.
+    listeners: Vec<std::thread::JoinHandle<()>>,
     mdns: Option<mdns_sd::ServiceDaemon>,
     pub events: Receiver<Event>,
 }
@@ -202,8 +204,11 @@ impl Remote {
         let (tx, events) = channel();
         let mut media_key = [0u8; 32];
         getrandom::getrandom(&mut media_key).map_err(|e| e.to_string())?;
+        // Versions start from the clock, so they keep going up across restarts and a phone
+        // never mistakes a new library for the one it has.
+        let start_version = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let shared = Arc::new(Shared {
-            library: RwLock::new(Arc::new(Snapshot::default())),
+            library: RwLock::new(Arc::new(Snapshot { version: start_version, ..Snapshot::default() })),
             pairing: Mutex::new(None),
             phones: Mutex::new(load_phones()),
             media_key,
@@ -216,14 +221,15 @@ impl Remote {
             search: Mutex::new(api::Search::default()),
         });
         let stop = Arc::new(AtomicBool::new(false));
+        let mut listeners = Vec::new();
         for (listener, tls) in [(main, Some(Arc::new(tls))), (media, None)] {
             let (shared, stop) = (shared.clone(), stop.clone());
             let media_only = tls.is_none();
             let handler: Arc<http::Handler> = Arc::new(move |req, body| api::handle(&shared, req, body, media_only));
-            std::thread::spawn(move || http::serve(listener, tls, handler, stop));
+            listeners.push(std::thread::spawn(move || http::serve(listener, tls, handler, stop)));
         }
         let mdns = announce(&shared).ok();
-        Ok(Self { shared, stop, mdns, events })
+        Ok(Self { shared, stop, listeners, mdns, events })
     }
 
     pub fn set_library(&self, snapshot: Snapshot) {
@@ -268,6 +274,10 @@ impl Remote {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // They notice within 100 ms and close their sockets.
+        for t in self.listeners.drain(..) {
+            let _ = t.join();
+        }
         if let Some(d) = self.mdns.take() {
             let _ = d.shutdown();
         }
@@ -551,6 +561,17 @@ mod tests {
         }
         let _ = browser.shutdown();
         assert_eq!(found, Some(Some(r.shared.fingerprint.clone())));
+    }
+
+    /// Turning it off and straight back on (or a second start) gets the same ports again.
+    #[test]
+    fn restarts_on_the_same_ports() {
+        std::env::set_var("BANANA_DATA", std::env::temp_dir().join(format!("banana-restart-{}", std::process::id())));
+        let first = Remote::start_on(egui::Context::default(), 0, 0).unwrap();
+        let (port, media) = (first.shared.port, first.shared.media_port);
+        drop(first);
+        let again = Remote::start_on(egui::Context::default(), port, media).unwrap();
+        assert_eq!((again.shared.port, again.shared.media_port), (port, media));
     }
 
     fn json_pair(code: &str) -> serde_json::Value {
