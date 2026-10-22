@@ -28,6 +28,9 @@ class _BananaAppState extends State<BananaApp> {
   String? _link;
   StreamSubscription<Uri>? _links;
 
+  /// Why the phone is back at pairing (the computer removed it), shown there.
+  String? _notice;
+
   @override
   void initState() {
     super.initState();
@@ -65,9 +68,11 @@ class _BananaAppState extends State<BananaApp> {
     } else if (_pairing == null || _link != null) {
       home = ConnectScreen(
         link: _link,
+        notice: _notice,
         onPaired: (p) => setState(() {
           _pairing = p;
           _link = null;
+          _notice = null;
         }),
         onCancel: _pairing == null ? null : () => setState(() => _link = null),
         onFailed: _clearLink,
@@ -76,9 +81,12 @@ class _BananaAppState extends State<BananaApp> {
       home = HomeScreen(
         key: ValueKey(_pairing!.fingerprint + (_pairing!.token ?? '')),
         pairing: _pairing!,
-        onUnpaired: () async {
+        onUnpaired: (why) async {
           await Pairing.forget();
-          setState(() => _pairing = null);
+          setState(() {
+            _pairing = null;
+            _notice = why;
+          });
         },
       );
     }

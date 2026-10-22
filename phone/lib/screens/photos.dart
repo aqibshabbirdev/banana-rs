@@ -30,10 +30,27 @@ class PhotosPage extends StatelessWidget {
                 : Text(library.error != null ? '${library.error}' : 'No photos on the computer yet.', textAlign: TextAlign.center),
           );
         }
-        return RefreshIndicator(
+        final grid = RefreshIndicator(
           onRefresh: () => library.refresh(force: true),
           child: PhotoGrid(items: library.items, api: api, cache: cache, library: library),
         );
+        if (library.error == null) return grid;
+        // The computer stopped answering: say so, and keep showing what was loaded.
+        return Column(children: [
+          Material(
+            color: Theme.of(context).colorScheme.errorContainer,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+              child: Row(children: [
+                const Icon(Icons.wifi_off, size: 18),
+                const SizedBox(width: 10),
+                Expanded(child: Text("Can't reach ${api.pairing.name} · showing what was loaded", style: Theme.of(context).textTheme.bodySmall)),
+                TextButton(onPressed: library.loading ? null : () => library.refresh(), child: const Text('Retry')),
+              ]),
+            ),
+          ),
+          Expanded(child: grid),
+        ]);
       },
     );
   }

@@ -14,8 +14,8 @@ class HomeScreen extends StatefulWidget {
 
   final Pairing pairing;
 
-  /// The computer removed this phone, or the user disconnected: back to pairing.
-  final Future<void> Function() onUnpaired;
+  /// The computer removed this phone (with why), or the user disconnected (null): back to pairing.
+  final Future<void> Function(String? why) onUnpaired;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -61,8 +61,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _unpaired() async {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${widget.pairing.name} removed this phone. Scan the code again to reconnect.')));
-    await widget.onUnpaired();
+    await widget.onUnpaired('${widget.pairing.name} removed this phone. Scan the code on the computer again to reconnect.');
   }
 
   @override
@@ -98,7 +97,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     if (ok == true) {
       await cache.emptyCache();
-      await widget.onUnpaired();
+      await widget.onUnpaired(null);
     }
   }
 

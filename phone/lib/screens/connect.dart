@@ -10,10 +10,13 @@ import '../api.dart';
 import '../main.dart' show banana;
 
 class ConnectScreen extends StatefulWidget {
-  const ConnectScreen({super.key, this.link, required this.onPaired, this.onCancel, this.onFailed});
+  const ConnectScreen({super.key, this.link, this.notice, required this.onPaired, this.onCancel, this.onFailed});
 
   /// A pairing link to use right away (opened from the camera app).
   final String? link;
+
+  /// Why the phone is here again (the computer removed it).
+  final String? notice;
   final void Function(Pairing) onPaired;
   final VoidCallback? onCancel;
 
@@ -101,6 +104,19 @@ class _ConnectScreenState extends State<ConnectScreen> {
               style: t.bodyLarge?.copyWith(color: Colors.white70),
               textAlign: TextAlign.center,
             ),
+            if (widget.notice != null) ...[
+              const SizedBox(height: 20),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(children: [
+                    const Icon(Icons.link_off),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text(widget.notice!)),
+                  ]),
+                ),
+              ),
+            ],
             const SizedBox(height: 32),
             for (final step in const [
               '1. On the computer, open Banana Photos → Connect phone and turn it on.',
