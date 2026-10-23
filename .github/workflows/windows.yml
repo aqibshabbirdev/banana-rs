@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   push:
     branches: [production]
-    paths: ["src/**", "Cargo.*", "assets/**", ".github/workflows/windows.yml", "scripts/*windows*"]
+    paths: ["src/**", "Cargo.*", "build.rs", "assets/**", "tests/**", ".github/workflows/windows.yml", "scripts/*windows*"]
 
 jobs:
   build:
@@ -31,7 +31,24 @@ jobs:
         run: cargo build --release --no-default-features --features heic
       - name: Test
         run: cargo test --release --no-default-features --features heic
+      - uses: actions/cache@v4
+        with:
+          path: dist/win/models
+          key: models-${{ hashFiles('scripts/fetch-models.sh') }}
+      - name: Models
+        shell: bash
+        run: scripts/fetch-models.sh dist/win/models
+      - name: Package (zip and installer)
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          Copy-Item target/release/banana-rs.exe dist/win/
+          Compress-Archive -Path dist/win/* -DestinationPath "dist/banana-rs-$version-windows-x64.zip" -Force
+          choco install innosetup -y --no-progress | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe" /Q "/DVersion=$version" "/DSource=$pwd\dist\win" scripts/windows-installer.iss
+          Get-ChildItem dist/*.zip, dist/*.exe | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         with:
-          name: banana-rs-windows-x64
-          path: target/release/banana-rs.exe
+          name: banana-photos-windows-x64
+          path: |
+            dist/*-windows-x64.zip
+            dist/*-x64-setup.exe

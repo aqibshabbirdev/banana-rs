@@ -73,6 +73,10 @@ block2 = "0.6"
 # Phones and cameras (iPhone, Android in PTP mode) through Image Capture.
 objc2-image-capture-core = { version = "0.3", features = ["ICDeviceBrowser", "ICDevice", "ICCameraDevice", "ICCameraItem", "objc2-core-graphics"] }
 
+[build-dependencies]
+# The .exe's icon and version on Windows (build.rs).
+winresource = "0.1"
+
 [features]
 default = ["heic", "video"]
 heic = ["dep:libheif-rs"]

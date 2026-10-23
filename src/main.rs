@@ -1,3 +1,6 @@
+// A window app on Windows: no console window next to it (debug builds keep one for logs).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod access;
 mod app;
 mod clip;
@@ -49,13 +52,11 @@ fn main() -> eframe::Result {
     #[cfg(not(debug_assertions))]
     let size = [1200.0, 800.0];
 
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Banana Photos")
-            .with_inner_size(size)
-            .with_min_inner_size([480.0, 360.0]),
-        ..Default::default()
-    };
+    let viewport = eframe::egui::ViewportBuilder::default().with_title("Banana Photos").with_inner_size(size).with_min_inner_size([480.0, 360.0]);
+    // The 🍌 in the title bar and taskbar (macOS takes it from the app bundle).
+    #[cfg(not(target_os = "macos"))]
+    let viewport = viewport.with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default());
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     eframe::run_native("banana-rs", options, Box::new(|cc| Ok(Box::new(app::PhotosApp::new(cc, start)))))
 }
