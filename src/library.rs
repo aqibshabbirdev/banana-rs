@@ -198,7 +198,7 @@ fn decode_scan(mut b: &[u8]) -> Option<HashMap<PathBuf, Photo>> {
             None
         } else {
             let (lat, lon) = (f32::from_le_bytes(take(&mut b)?), f32::from_le_bytes(take(&mut b)?));
-            Some((lat, lon)).filter(|_| !lat.is_nan() && !lon.is_nan())
+            (!lat.is_nan() && !lon.is_nan()).then_some((lat, lon))
         };
         if v1 && !is_video {
             continue;
