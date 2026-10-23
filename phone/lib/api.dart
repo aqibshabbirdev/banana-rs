@@ -250,6 +250,15 @@ class Api {
 
   Future<void> favorite(String id, bool on) => _send('POST', '/api/favorite/$id', query: {'on': on ? '1' : '0'});
 
+  /// Favourites (or not) several at once.
+  Future<void> favorites(List<String> ids, bool on) => _send('POST', '/api/favorites', body: jsonEncode({'ids': ids, 'on': on}));
+
+  /// Moves photos to the computer's Trash. Returns how many went, and why others didn't.
+  Future<({int trashed, int skipped, List<String> errors})> trash(List<String> ids) async {
+    final j = await _send('POST', '/api/trash', body: jsonEncode({'ids': ids}));
+    return (trashed: j['trashed'] as int, skipped: j['skipped'] as int, errors: (j['errors'] as List).cast<String>());
+  }
+
   Future<bool> has(String name, int size, int taken) async =>
       (await getJson('/api/has', {'name': name, 'size': '$size', 'taken': '$taken'}))['have'] == true;
 

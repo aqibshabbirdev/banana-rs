@@ -116,6 +116,13 @@ The photo upright as JPEG, at most `max` pixels on the long side (64–8192, def
 
 `on=0` removes the favourite. → `{"favorite": true}`.
 
+### `POST /api/favorites` and `POST /api/trash`
+
+Several at once, with a JSON body `{"ids": ["...", "..."]}` (favorites also takes `"on": true|false`). Unknown ids are ignored.
+
+- favorites → `{"changed": 2}`
+- trash moves the files to the computer's Trash (Finder's on macOS, the freedesktop one on Linux, where they can be put back), leaving ones inside an Apple Photos library alone → `{"trashed": 1, "skipped": 0, "errors": []}`. The computer remembers what was deleted, so `/api/has` says `true` for it and a phone's backup doesn't send it back.
+
 ### Albums and people
 
 `GET /api/albums` → `{"albums": [{"id": "0", "name": "Trip", "count": 42, "cover": "<photo id>"}]}`: the albums made on the computer.

@@ -2352,6 +2352,7 @@ impl PhotosApp {
                     moved += 1;
                     if let Some((mtime, size)) = info {
                         self.forget_photo(path, mtime, size);
+                        remote::note_deleted(&[(path.clone(), size)]);
                     }
                 }
                 Err(e) => errors.push(format!("{}: {e}", path.file_name().unwrap_or_default().to_string_lossy())),
@@ -3102,7 +3103,8 @@ impl PhotosApp {
     fn poll_remote(&mut self, ctx: &egui::Context, now: f64) {
         let Some(r) = &self.remote else { return };
         let mut favorites_changed = false;
-        while let Ok(e) = r.events.try_recv() {
+        let events: Vec<remote::Event> = r.events.try_iter().collect();
+        for e in events {
             match e {
                 remote::Event::Paired(name) => {
                     self.notice = Some(format!("{name} is connected. It can now see your library on this network."));
@@ -3113,6 +3115,19 @@ impl PhotosApp {
                 remote::Event::Favorite(path, on) => {
                     self.store.set_favorite(&path, on);
                     favorites_changed = true;
+                }
+                remote::Event::Trashed(gone) => {
+                    for (path, mtime, size) in &gone {
+                        self.forget_photo(path, *mtime, *size);
+                    }
+                    if self.people_index_dirty {
+                        self.people_index.save();
+                        self.people_index_dirty = false;
+                    }
+                    self.clip_embeddings.save();
+                    self.selected.clear();
+                    self.viewer = None;
+                    self.remote_rescan_at = Some(now + 1.0);
                 }
             }
         }

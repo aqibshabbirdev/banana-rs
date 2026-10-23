@@ -12,7 +12,7 @@
 pub mod api;
 mod http;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +85,8 @@ pub enum Event {
     /// A photo or video was uploaded into the library folder; scan it.
     Uploaded,
     Favorite(PathBuf, bool),
+    /// Moved to the Trash from a phone (path, mtime, size): forget them and re-scan.
+    Trashed(Vec<(PathBuf, u64, u64)>),
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -166,6 +168,10 @@ impl Shared {
                 it.favorite = on;
             }
         });
+    }
+
+    fn remove_photos(&self, ids: &[u64]) {
+        self.edit_library(|items| items.retain(|it| !ids.contains(&it.id)));
     }
 
     fn send(&self, e: Event) {
@@ -414,6 +420,34 @@ fn load_or_make_cert() -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((cert, key))
 }
 
+/// Files deleted from the library (lower-case name, size), from a phone or on the computer: a
+/// phone's backup mustn't send them back. Kept in phone/deleted.json.
+fn deleted() -> &'static Mutex<HashSet<(String, u64)>> {
+    static DELETED: std::sync::OnceLock<Mutex<HashSet<(String, u64)>>> = std::sync::OnceLock::new();
+    DELETED.get_or_init(|| {
+        let list: Vec<(String, u64)> = dir().map(|d| crate::store::load_json(&d.join("deleted.json"))).unwrap_or_default();
+        Mutex::new(list.into_iter().collect())
+    })
+}
+
+/// Remembers files moved to the Trash (path, size), so backups from phones skip them.
+pub fn note_deleted(files: &[(PathBuf, u64)]) {
+    let mut set = deleted().lock().unwrap();
+    for (path, size) in files {
+        if let Some(name) = path.file_name() {
+            set.insert((name.to_string_lossy().to_lowercase(), *size));
+        }
+    }
+    let list: Vec<&(String, u64)> = set.iter().collect();
+    if let (Some(d), Ok(json)) = (dir(), serde_json::to_vec(&list)) {
+        crate::store::write_atomic(&d.join("deleted.json"), &json);
+    }
+}
+
+pub fn was_deleted(name: &str, size: u64) -> bool {
+    deleted().lock().unwrap().contains(&(name.to_lowercase(), size))
+}
+
 fn load_phones() -> Vec<Phone> {
     dir().map(|d| crate::store::load_json(&d.join("phones.json"))).unwrap_or_default()
 }
@@ -654,6 +688,27 @@ mod tests {
         assert_eq!(back["status"], "skipped");
         let saved = crate::transfer::media_files(&root.join("Imported").join("Test phone"));
         assert_eq!(saved.len(), 1);
+
+        // Several at once: favourites, and (on Linux, where the test can use a throwaway Trash)
+        // moving to the Trash.
+        let both = serde_json::json!({ "ids": [beach, video], "on": true });
+        let done: serde_json::Value = a.post(&url("/api/favorites")).set("Authorization", &auth).send_json(both).unwrap().into_json().unwrap();
+        assert_eq!(done["changed"], 2);
+        let favs: serde_json::Value = get("/api/photos").call().unwrap().into_json().unwrap();
+        assert_eq!(favs["items"].as_array().unwrap().iter().filter(|i| i["favorite"] == true).count(), 2);
+        #[cfg(target_os = "linux")]
+        {
+            while r.events.try_recv().is_ok() {}
+            let gone: serde_json::Value = a.post(&url("/api/trash")).set("Authorization", &auth).send_json(serde_json::json!({ "ids": [video, "ffff"] })).unwrap().into_json().unwrap();
+            assert_eq!((gone["trashed"].as_u64(), gone["skipped"].as_u64()), (Some(1), Some(0)));
+            assert!(!root.join("clip.mp4").exists());
+            assert!(matches!(r.events.try_recv(), Ok(Event::Trashed(t)) if t[0].0 == root.join("clip.mp4")));
+            let left: serde_json::Value = get("/api/photos").call().unwrap().into_json().unwrap();
+            assert!(left["items"].as_array().unwrap().iter().all(|i| i["id"] != video.as_str()));
+            // The phone still has it: its next backup mustn't send it back.
+            let has: serde_json::Value = get("/api/has?name=clip.mp4&size=10&taken=1700000000").call().unwrap().into_json().unwrap();
+            assert_eq!(has["have"], true);
+        }
 
         // Removing the phone on the computer cuts it off at once.
         let key = r.phones()[0].key().to_string();

@@ -142,6 +142,29 @@ class Library extends ChangeNotifier {
     }
   }
 
+  Future<void> setFavorites(List<Item> items, bool on) async {
+    final was = {for (final i in items) i: i.favorite};
+    for (final i in items) {
+      i.favorite = on;
+    }
+    notifyListeners();
+    try {
+      await api.favorites([for (final i in items) i.id], on);
+    } catch (e) {
+      was.forEach((i, f) => i.favorite = f);
+      notifyListeners();
+      rethrow;
+    }
+  }
+
+  /// Moves photos to the computer's Trash and takes them off the timeline here.
+  Future<({int trashed, int skipped, List<String> errors})> trash(List<Item> items) async {
+    final r = await api.trash([for (final i in items) i.id]);
+    // The computer has the final word on what's left.
+    await refresh(force: true);
+    return r;
+  }
+
   @override
   void dispose() {
     _poll?.cancel();

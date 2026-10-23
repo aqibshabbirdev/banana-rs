@@ -92,8 +92,67 @@ pub fn handle(shared: &Shared, req: &Request, body: &mut dyn Read, media_only: b
             }
             None => Response::error(404, "no such photo"),
         },
+        ("POST", "favorites", 2) => match read_json(body, req.body_len) {
+            Some(v) => {
+                let on = v["on"].as_bool().unwrap_or(true);
+                let items = items_of(&lib, &v);
+                for it in &items {
+                    shared.set_favorite(it.id, on);
+                    shared.send(Event::Favorite(it.path.clone(), on));
+                }
+                Response::json(200, &json!({ "changed": items.len() }))
+            }
+            None => Response::error(400, "needs {\"ids\": [...], \"on\": true|false}"),
+        },
+        ("POST", "trash", 2) => match read_json(body, req.body_len) {
+            Some(v) => trash(shared, &items_of(&lib, &v)),
+            None => Response::error(400, "needs {\"ids\": [...]}"),
+        },
         _ => Response::error(404, "no such route"),
     }
+}
+
+/// A small JSON body (a list of ids at most).
+fn read_json(body: &mut dyn Read, len: u64) -> Option<Value> {
+    if len > 4 << 20 {
+        return None;
+    }
+    let mut raw = Vec::new();
+    body.take(len).read_to_end(&mut raw).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// The library items named in `{"ids": [...]}`; unknown ids are left out.
+fn items_of<'a>(lib: &'a Snapshot, v: &Value) -> Vec<&'a Item> {
+    let ids = v["ids"].as_array().map(Vec::as_slice).unwrap_or_default();
+    ids.iter()
+        .filter_map(|id| u64::from_str_radix(id.as_str()?, 16).ok())
+        .filter_map(|id| lib.by_id.get(&id))
+        .map(|&i| &lib.items[i])
+        .collect()
+}
+
+/// Moves photos to the computer's Trash (where they can be put back), like Move to Trash in
+/// the app. Ones in an Apple Photos library are left to Photos.
+fn trash(shared: &Shared, items: &[&Item]) -> Response {
+    let ctx = crate::duplicates::trash_context();
+    let (mut moved, mut skipped, mut errors) = (Vec::new(), 0, Vec::new());
+    for it in items {
+        if crate::duplicates::in_photos_library(&it.path) {
+            skipped += 1;
+            continue;
+        }
+        match ctx.delete(&it.path) {
+            Ok(()) => moved.push(*it),
+            Err(e) => errors.push(format!("{}: {e}", it.path.file_name().unwrap_or_default().to_string_lossy())),
+        }
+    }
+    if !moved.is_empty() {
+        super::note_deleted(&moved.iter().map(|it| (it.path.clone(), it.size)).collect::<Vec<_>>());
+        shared.remove_photos(&moved.iter().map(|it| it.id).collect::<Vec<_>>());
+        shared.send(Event::Trashed(moved.iter().map(|it| (it.path.clone(), it.mtime, it.size)).collect()));
+    }
+    Response::json(200, &json!({ "trashed": moved.len(), "skipped": skipped, "errors": errors }))
 }
 
 fn pair(shared: &Shared, body: &mut dyn Read, len: u64) -> Response {
@@ -302,7 +361,7 @@ fn has(lib: &Snapshot, phone: &str, req: &Request) -> Response {
     ) else {
         return Response::error(400, "needs name, size and taken");
     };
-    let have = crate::transfer::already_imported(&dir, name, taken, size) || in_library(lib, name, size);
+    let have = crate::transfer::already_imported(&dir, name, taken, size) || in_library(lib, name, size) || super::was_deleted(name, size);
     Response::json(200, &json!({ "have": have }))
 }
 
@@ -344,7 +403,7 @@ fn upload(shared: &Shared, lib: &Snapshot, phone: &str, req: &Request, body: &mu
             return Response::error(400, "upload cut short");
         }
     }
-    if in_library(lib, name, req.body_len) {
+    if in_library(lib, name, req.body_len) || super::was_deleted(name, req.body_len) {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_dir(&tmp_dir);
         return Response::json(200, &json!({ "status": "skipped" }));
