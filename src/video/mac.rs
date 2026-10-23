@@ -11,7 +11,7 @@ use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_av_foundation::{
-    AVAsset, AVAssetExportPreset1920x1080, AVAssetExportSession, AVAssetExportSessionStatus, AVAssetImageGenerator, AVFileTypeMPEG4, AVAssetTrack, AVMediaTypeVideo, AVPlayer, AVPlayerItem, AVPlayerItemVideoOutput,
+    AVAsset, AVAssetExportPreset1920x1080, AVMetadataCommonKeyLocation, AVAssetExportSession, AVAssetExportSessionStatus, AVAssetImageGenerator, AVFileTypeMPEG4, AVAssetTrack, AVMediaTypeVideo, AVPlayer, AVPlayerItem, AVPlayerItemVideoOutput,
     AVURLAsset,
 };
 use objc2_core_foundation::{CFString, CGSize};
@@ -62,7 +62,12 @@ pub fn probe(path: &Path) -> Option<VideoInfo> {
             .and_then(|m| unsafe { m.dateValue() })
             .and_then(|d| DateTime::from_timestamp(d.timeIntervalSince1970() as i64, 0))
             .map(|utc| utc.with_timezone(&Local).naive_local());
-        Some(VideoInfo { width, height, duration, created })
+        let location = unsafe { asset.commonMetadata() }.iter().find_map(|item| {
+            let key = unsafe { item.commonKey() }?;
+            (Some(&*key) == unsafe { AVMetadataCommonKeyLocation }).then(|| unsafe { item.stringValue() }).flatten()
+        });
+        let location = location.and_then(|s| super::parse_iso6709(&s.to_string()));
+        Some(VideoInfo { width, height, duration, created, location })
     })
 }
 

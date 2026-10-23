@@ -55,7 +55,12 @@ pub fn probe(path: &Path) -> Option<VideoInfo> {
         let date = NaiveDate::from_ymd_opt(dt.year(), dt.month()? as u32, dt.day()? as u32)?;
         date.and_hms_opt(dt.hour().unwrap_or(0) as u32, dt.minute().unwrap_or(0) as u32, dt.second().unwrap_or(0) as u32)
     });
-    Some(VideoInfo { width, height, duration, created })
+    let location = info.tags().and_then(|t| {
+        let lat = t.get::<gst::tags::GeoLocationLatitude>()?.get();
+        let lon = t.get::<gst::tags::GeoLocationLongitude>()?.get();
+        (lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat, lon) != (0.0, 0.0)).then_some((lat as f32, lon as f32))
+    });
+    Some(VideoInfo { width, height, duration, created, location })
 }
 
 fn playbin(path: &Path, with_audio: bool) -> Option<(gst::Element, gst_app::AppSink)> {

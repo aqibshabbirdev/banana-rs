@@ -34,6 +34,67 @@ pub struct VideoInfo {
     pub duration: f32,
     /// When the camera recorded it, if the file says.
     pub created: Option<NaiveDateTime>,
+    /// Where (latitude, longitude), if the file says.
+    pub location: Option<(f32, f32)>,
+}
+
+/// Where an MP4/MOV was recorded, read from its `moov` box: the ISO 6709 string phones store
+/// under `com.apple.quicktime.location.ISO6709` (iPhone) or in a `©xyz` box (Android). For when
+/// the video backend doesn't report it (GStreamer doesn't read the first kind).
+pub fn location_from_file(path: &Path) -> Option<(f32, f32)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut at = 0u64;
+    // Top-level boxes: size (u32, 1 = a u64 follows, 0 = to the end) and type.
+    while at + 8 <= len {
+        f.seek(SeekFrom::Start(at)).ok()?;
+        let mut head = [0u8; 16];
+        f.read_exact(&mut head[..8]).ok()?;
+        let (mut size, kind) = (u32::from_be_bytes(head[..4].try_into().ok()?) as u64, [head[4], head[5], head[6], head[7]]);
+        let mut header = 8;
+        if size == 1 {
+            f.read_exact(&mut head[8..16]).ok()?;
+            size = u64::from_be_bytes(head[8..16].try_into().ok()?);
+            header = 16;
+        } else if size == 0 {
+            size = len - at;
+        }
+        if size < header {
+            return None;
+        }
+        if &kind == b"moov" {
+            // The movie's index, usually well under a few MB; a broken size isn't read whole.
+            let mut moov = vec![0u8; (size - header).min(64 << 20) as usize];
+            f.read_exact(&mut moov).ok()?;
+            return location_in(&moov);
+        }
+        at += size;
+    }
+    None
+}
+
+fn location_in(moov: &[u8]) -> Option<(f32, f32)> {
+    let find = |needle: &[u8]| moov.windows(needle.len()).position(|w| w == needle);
+    // The string comes after its key (in `ilst`, after the list of keys) or right after the
+    // `©xyz` box header: the first thing from there on that reads as a point.
+    let from = find(b"location.ISO6709").or_else(|| find(b"\xa9xyz"))?;
+    let rest = &moov[from..];
+    (0..rest.len()).filter(|&i| rest[i] == b'+' || rest[i] == b'-').find_map(|i| {
+        let text: String = rest[i..].iter().take(40).take_while(|&&c| c.is_ascii_digit() || b"+-./".contains(&c)).map(|&c| c as char).collect();
+        parse_iso6709(&text)
+    })
+}
+
+/// An ISO 6709 point as phones write it in videos: "+33.8912+073.4472+512.000/".
+pub fn parse_iso6709(s: &str) -> Option<(f32, f32)> {
+    let s = s.trim().trim_end_matches('/');
+    // Each number starts at a sign: latitude, longitude, then maybe altitude.
+    let starts: Vec<usize> = s.char_indices().filter(|(_, c)| *c == '+' || *c == '-').map(|(i, _)| i).collect();
+    let (&a, &b) = (starts.first()?, starts.get(1)?);
+    let lat: f32 = s.get(a..b)?.parse().ok()?;
+    let lon: f32 = s.get(b..*starts.get(2).unwrap_or(&s.len()))?.parse().ok()?;
+    (lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat, lon) != (0.0, 0.0)).then_some((lat, lon))
 }
 
 pub fn is_video(path: &Path) -> bool {
@@ -123,6 +184,18 @@ mod tests {
     /// Converts the video in BANANA_TEST_VIDEO (say an HEVC one from an iPhone) and checks the
     /// result. Needs AVFoundation or ffmpeg, so it's run by hand:
     ///   BANANA_TEST_VIDEO=clip.mov cargo test --release convert_for_phone -- --ignored
+    #[test]
+    fn video_locations() {
+        assert_eq!(super::parse_iso6709("+33.6303+073.1222+512.000/"), Some((33.6303, 73.1222)));
+        assert_eq!(super::parse_iso6709("-33.8688+151.2093/"), Some((-33.8688, 151.2093)));
+        assert_eq!(super::parse_iso6709("+00.0000+000.0000/"), None);
+        // As in an iPhone's moov: the key list, binary sizes (with '+' and '-' bytes), then the value.
+        let mut moov = b"keys\0\0\0\x2dmdtacom.apple.quicktime.location.ISO6709\0\0\0\x2bmdtacom.apple.quicktime.make".to_vec();
+        moov.extend_from_slice(b"ilst\0\0\0\x2d\0\0\0\x01\0\0\0\x25data\0\0\0\x01\0\0\0\0+33.6303+073.1222+512.000/");
+        assert_eq!(super::location_in(&moov), Some((33.6303, 73.1222)));
+        assert_eq!(super::location_in(b"moov without one"), None);
+    }
+
     #[test]
     #[ignore]
     fn convert_for_phone() {

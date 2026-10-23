@@ -32,6 +32,8 @@ pub struct Photo {
     pub is_video: bool,
     /// Video length in seconds, when the backend could read it.
     pub duration: Option<f32>,
+    /// Where it was taken (latitude, longitude in degrees), when the camera recorded it.
+    pub gps: Option<(f32, f32)>,
 }
 
 pub enum ScanMsg {
@@ -101,14 +103,17 @@ pub fn spawn_scan(root: PathBuf, gen: u64, tx: Sender<ScanMsg>, ctx: eframe::egu
 
 /// What the last scans found, saved as `scan.bin` in the data folder: per file its modified
 /// time and size (to tell it hasn't changed), and what reading it gave.
-/// File: b"BSCAN\0\0\x01", count u32, then per photo: path length u32, path bytes, mtime u64,
+/// File: b"BSCAN\0\0\x02", count u32, then per photo: path length u32, path bytes, mtime u64,
 /// size u64, taken i64 (seconds, as local wall-clock time), from_exif u8, aspect f32, is_video u8,
-/// duration f32 (NaN: unknown). Little-endian.
+/// duration f32 (NaN: unknown), latitude f32 and longitude f32 (NaN: no location). Little-endian.
+/// Version 1 had no location: its videos are kept (probing them is what's slow), its photos are
+/// read again once, for their location.
 pub struct ScanCache {
     entries: HashMap<PathBuf, Photo>,
 }
 
-const SCAN_MAGIC: &[u8; 8] = b"BSCAN\0\0\x01";
+const SCAN_MAGIC: &[u8; 8] = b"BSCAN\0\0\x02";
+const SCAN_MAGIC_V1: &[u8; 8] = b"BSCAN\0\0\x01";
 
 impl ScanCache {
     fn file() -> Option<PathBuf> {
@@ -158,6 +163,9 @@ fn encode_scan(entries: &HashMap<PathBuf, Photo>) -> Vec<u8> {
         out.extend_from_slice(&p.aspect.to_le_bytes());
         out.push(p.is_video as u8);
         out.extend_from_slice(&p.duration.unwrap_or(f32::NAN).to_le_bytes());
+        let (lat, lon) = p.gps.unwrap_or((f32::NAN, f32::NAN));
+        out.extend_from_slice(&lat.to_le_bytes());
+        out.extend_from_slice(&lon.to_le_bytes());
     }
     out
 }
@@ -168,9 +176,11 @@ fn decode_scan(mut b: &[u8]) -> Option<HashMap<PathBuf, Photo>> {
         b.read_exact(&mut a).ok()?;
         Some(a)
     }
-    if take::<8>(&mut b)? != *SCAN_MAGIC {
-        return None;
-    }
+    let v1 = match &take::<8>(&mut b)? {
+        m if m == SCAN_MAGIC => false,
+        m if m == SCAN_MAGIC_V1 => true,
+        _ => return None,
+    };
     let n = u32::from_le_bytes(take(&mut b)?) as usize;
     let mut out = HashMap::with_capacity(n.min(1 << 20));
     for _ in 0..n {
@@ -184,8 +194,17 @@ fn decode_scan(mut b: &[u8]) -> Option<HashMap<PathBuf, Photo>> {
         let aspect = f32::from_le_bytes(take(&mut b)?);
         let is_video = take::<1>(&mut b)?[0] != 0;
         let duration = Some(f32::from_le_bytes(take(&mut b)?)).filter(|d| !d.is_nan());
+        let gps = if v1 {
+            None
+        } else {
+            let (lat, lon) = (f32::from_le_bytes(take(&mut b)?), f32::from_le_bytes(take(&mut b)?));
+            Some((lat, lon)).filter(|_| !lat.is_nan() && !lon.is_nan())
+        };
+        if v1 && !is_video {
+            continue;
+        }
         let added = DateTime::from_timestamp(mtime as i64, 0)?.with_timezone(&Local).naive_local();
-        out.insert(path.clone(), Photo { path, taken, from_exif, mtime, size, added, aspect, is_video, duration });
+        out.insert(path.clone(), Photo { path, taken, from_exif, mtime, size, added, aspect, is_video, duration, gps });
     }
     Some(out)
 }
@@ -211,8 +230,9 @@ pub fn read_photo(path: &Path) -> Option<Photo> {
             .filter(|i| i.width > 0 && i.height > 0)
             .map(|i| i.width as f32 / i.height as f32)
             .unwrap_or(16.0 / 9.0);
+        let gps = info.as_ref().and_then(|i| i.location).or_else(|| crate::video::location_from_file(path));
         let duration = info.map(|i| i.duration).filter(|d| *d > 0.0);
-        return Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect, is_video: true, duration });
+        return Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect, is_video: true, duration, gps });
     }
 
     let exif = read_exif(path);
@@ -226,7 +246,8 @@ pub fn read_photo(path: &Path) -> Option<Photo> {
         .map(|(w, h)| w as f32 / h as f32)
         .unwrap_or(1.0);
 
-    Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect, is_video: false, duration: None })
+    let gps = exif.as_ref().and_then(exif_gps);
+    Some(Photo { path: path.to_path_buf(), taken, from_exif, mtime, size: meta.len(), added, aspect, is_video: false, duration: None, gps })
 }
 
 /// Width and height the way the photo is shown, i.e. after rotation. Reads headers only.
@@ -286,6 +307,23 @@ fn exif_orientation(exif: &exif::Exif) -> Option<u32> {
     exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?.value.get_uint(0)
 }
 
+/// Latitude and longitude from the GPS tags (degrees, minutes, seconds and N/S, E/W).
+fn exif_gps(exif: &exif::Exif) -> Option<(f32, f32)> {
+    let degrees = |tag, reference, negative: u8| -> Option<f64> {
+        let exif::Value::Rational(ref v) = exif.get_field(tag, exif::In::PRIMARY)?.value else { return None };
+        let d = v.iter().take(3).zip([1.0, 60.0, 3600.0]).map(|(r, div)| r.to_f64() / div).sum::<f64>();
+        let sign = match exif.get_field(reference, exif::In::PRIMARY).map(|f| &f.value) {
+            Some(exif::Value::Ascii(a)) if a.first().and_then(|s| s.first()) == Some(&negative) => -1.0,
+            _ => 1.0,
+        };
+        Some(d * sign).filter(|d| d.is_finite())
+    };
+    let lat = degrees(exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef, b'S')?;
+    let lon = degrees(exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef, b'W')?;
+    // 0,0 is what some cameras write when they had no fix.
+    (lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat, lon) != (0.0, 0.0)).then_some((lat as f32, lon as f32))
+}
+
 fn exif_date(exif: &exif::Exif) -> Option<NaiveDateTime> {
     for tag in [exif::Tag::DateTimeOriginal, exif::Tag::DateTimeDigitized, exif::Tag::DateTime] {
         let Some(field) = exif.get_field(tag, exif::In::PRIMARY) else { continue };
@@ -310,7 +348,7 @@ mod tests {
         let mtime = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let taken = NaiveDate::from_ymd_opt(2024, 5, 17).unwrap().and_hms_opt(10, 30, 0).unwrap();
         let added = DateTime::from_timestamp(mtime as i64, 0).unwrap().with_timezone(&Local).naive_local();
-        Photo { path: path.to_path_buf(), taken, from_exif: true, mtime, size: meta.len(), added, aspect, is_video: false, duration: None }
+        Photo { path: path.to_path_buf(), taken, from_exif: true, mtime, size: meta.len(), added, aspect, is_video: false, duration: None, gps: None }
     }
 
     #[test]
@@ -326,10 +364,12 @@ mod tests {
         video.path = dir.join("clip.mp4");
         video.is_video = true;
         video.duration = Some(12.5);
-        let entries: HashMap<PathBuf, Photo> =
-            [photo(&same, 1.5), photo(&changed, 0.75), video].into_iter().map(|p| (p.path.clone(), p)).collect();
+        let mut placed = photo(&same, 1.5);
+        placed.gps = Some((31.52, 74.35));
+        let entries: HashMap<PathBuf, Photo> = [placed, photo(&changed, 0.75), video].into_iter().map(|p| (p.path.clone(), p)).collect();
         let decoded = decode_scan(&encode_scan(&entries)).unwrap();
         assert_eq!(decoded.len(), 3);
+        assert_eq!((decoded[&same].gps, decoded[&changed].gps), (Some((31.52, 74.35)), None));
         let v = &decoded[&dir.join("clip.mp4")];
         assert!(v.is_video && v.duration == Some(12.5) && v.taken == entries[&dir.join("clip.mp4")].taken && v.from_exif);
         assert_eq!(decoded[&same].duration, None);
@@ -340,7 +380,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(cache.get(&changed).is_none());
         assert!(cache.get(&dir.join("clip.mp4")).is_none(), "a file that's gone isn't served from the cache");
-        assert!(decode_scan(b"BSCAN\0\0\x02\0\0\0\0").is_none(), "another version is ignored");
+        assert!(decode_scan(b"BSCAN\0\0\x03\0\0\0\0").is_none(), "another version is ignored");
+    }
+
+    /// A cache from before locations were kept: videos stay, photos are read again.
+    #[test]
+    fn scan_cache_from_version_1_keeps_only_videos() {
+        let mut v1 = SCAN_MAGIC_V1.to_vec();
+        v1.extend_from_slice(&2u32.to_le_bytes());
+        for (name, video) in [("a.jpg", 0u8), ("b.mp4", 1)] {
+            v1.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            v1.extend_from_slice(name.as_bytes());
+            v1.extend_from_slice(&5u64.to_le_bytes()); // mtime
+            v1.extend_from_slice(&9u64.to_le_bytes()); // size
+            v1.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+            v1.push(1);
+            v1.extend_from_slice(&1.5f32.to_le_bytes());
+            v1.push(video);
+            v1.extend_from_slice(&3.0f32.to_le_bytes());
+        }
+        let got = decode_scan(&v1).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got[Path::new("b.mp4")].is_video && got[Path::new("b.mp4")].gps.is_none());
+    }
+
+    /// Where a real photo was taken. Run by hand with a photo that has a location:
+    ///   BANANA_TEST_PHOTO=IMG_1234.HEIC cargo test --release photo_location -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn photo_location() {
+        let p = read_photo(Path::new(&std::env::var("BANANA_TEST_PHOTO").unwrap())).unwrap();
+        println!("gps: {:?}", p.gps);
+        assert!(p.gps.is_some());
     }
 
     #[test]
