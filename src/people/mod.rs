@@ -229,6 +229,11 @@ pub fn spawn(jobs: Vec<Job>, gen: u64, current: Arc<AtomicU64>, models: PathBuf,
                 ctx.request_repaint();
             });
         });
+        // Hand what the analysis threads freed back to the system (glibc keeps it otherwise).
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
         let _ = tx.send(Msg::Finished { gen });
         ctx.request_repaint();
     });

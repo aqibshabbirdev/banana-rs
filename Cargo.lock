@@ -648,6 +648,7 @@ dependencies = [
  "if-addrs",
  "image",
  "kamadak-exif",
+ "libc",
  "libheif-rs",
  "mdns-sd",
  "objc2 0.6.5",

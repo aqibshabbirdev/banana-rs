@@ -51,6 +51,10 @@ gstreamer-pbutils = { version = "0.25", optional = true }
 gstreamer-video = { version = "0.25", optional = true }
 
 # Video on macOS goes through AVFoundation (hardware decoding, audio), nothing to install.
+# glibc's malloc settings (see main.rs).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
