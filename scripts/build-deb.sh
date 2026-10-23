@@ -64,6 +64,7 @@ Architecture: $ARCH
 Maintainer: Aqib Shabbir <aqibshabbirdev@users.noreply.github.com>
 Installed-Size: $SIZE
 Depends: $DEPENDS
+Recommends: ffmpeg
 Section: graphics
 Priority: optional
 Homepage: https://github.com/aqibshabbirdev/banana-rs

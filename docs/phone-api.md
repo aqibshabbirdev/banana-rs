@@ -147,6 +147,16 @@ GET /api/media-url/<id>  →  {"url": "http://192.168.1.5:47821/m/0c4d8e2f11b3a9
 
 Open `url` in the player as is. It's plain HTTP on the media port, needs no header, works for that one file only, and expires after 6 hours (ask again then). Links stop working when the computer restarts the server.
 
+When the phone can't play a video (HEVC or Dolby Vision on some Android phones, AVI, MKV…), it asks the computer to convert it:
+
+```
+GET /api/compat/<id>  →  {"status": "converting", "progress": 0.4}
+                      →  {"status": "ready", "url": "http://…/m/<id>?e=…&s=…&v=c", "expires": …}
+                      →  {"status": "failed", "error": "ffmpeg isn't installed on the computer (sudo apt install ffmpeg)"}
+```
+
+The first call starts converting to H.264/AAC MP4, 1080p at most (AVFoundation on macOS, ffmpeg on Linux), one video at a time. Ask again every couple of seconds until it's `ready`. Converted videos are kept (up to 4 GB, oldest dropped first), so the next time it's `ready` at once.
+
 ## 4. Backup (phone → computer)
 
 For each photo or video in the phone's gallery (`photo_manager`):

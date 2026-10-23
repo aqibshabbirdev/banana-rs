@@ -280,9 +280,13 @@ class VideoPage extends StatefulWidget {
 class _VideoPageState extends State<VideoPage> {
   VideoPlayerController? _video;
 
-  /// The computer answers but this phone can't play the video (its format).
-  bool _unplayable = false;
+  /// The computer answers but this phone can't play the video (its format), and converting it
+  /// there failed: why.
+  String? _unplayable;
   Timer? _retry;
+
+  /// Converting it on the computer to a format this phone plays: how far (0–1), null when not.
+  double? _converting;
 
   @override
   void initState() {
@@ -293,7 +297,7 @@ class _VideoPageState extends State<VideoPage> {
   @override
   void didUpdateWidget(VideoPage old) {
     super.didUpdateWidget(old);
-    if (widget.active && _video == null && _retry == null && !_unplayable) _start();
+    if (widget.active && _video == null && _retry == null && _unplayable == null && _converting == null) _start();
     if (!widget.active) _video?.pause();
   }
 
@@ -313,13 +317,58 @@ class _VideoPageState extends State<VideoPage> {
     } catch (_) {
       await v?.dispose();
       if (!mounted) return;
-      // The player failed although the computer serves the file: the phone can't decode it.
-      // Anything else (computer off, or just started and still scanning): wait and try again.
+      // The player failed although the computer serves the file: the phone can't decode it, so
+      // have the computer convert it. Anything else (computer off, or just started and still
+      // scanning): wait and try again.
       if (url != null && await _serves(url)) {
-        if (mounted) setState(() => _unplayable = true);
+        if (mounted) _convert();
       } else if (mounted) {
         _retry = Timer(retryAfter, _start);
         setState(() {});
+      }
+    }
+  }
+
+  /// Asks the computer for a copy this phone can play, every couple of seconds until it's made,
+  /// then plays that.
+  Future<void> _convert() async {
+    setState(() => _converting = 0);
+    while (mounted) {
+      Map<String, dynamic> j;
+      try {
+        j = await widget.api.compat(widget.item.id);
+      } catch (_) {
+        await Future<void>.delayed(retryAfter);
+        continue;
+      }
+      if (!mounted) return;
+      switch (j['status']) {
+        case 'ready':
+          final v = VideoPlayerController.networkUrl(Uri.parse(j['url'] as String));
+          try {
+            await v.initialize();
+          } catch (_) {
+            await v.dispose();
+            if (mounted) setState(() => _unplayable = "This phone can't play this video, even converted.");
+            return;
+          }
+          if (!mounted) return v.dispose();
+          v.addListener(() => mounted ? setState(() {}) : null);
+          setState(() {
+            _video = v;
+            _converting = null;
+          });
+          if (widget.active) await v.play();
+          return;
+        case 'failed':
+          setState(() {
+            _converting = null;
+            _unplayable = "This phone can't play this video's format, and ${widget.api.pairing.name} couldn't convert it: ${j['error']}";
+          });
+          return;
+        default:
+          setState(() => _converting = (j['progress'] as num?)?.toDouble() ?? 0);
+          await Future<void>.delayed(const Duration(seconds: 2));
       }
     }
   }
@@ -350,14 +399,23 @@ class _VideoPageState extends State<VideoPage> {
   @override
   Widget build(BuildContext context) {
     final v = _video;
-    if (_unplayable) {
+    final converting = _converting;
+    if (_unplayable != null || converting != null) {
       return Stack(alignment: Alignment.center, children: [
         Positioned.fill(child: Opacity(opacity: 0.35, child: ThumbWithSpinner(item: widget.item, api: widget.api, cache: widget.cache))),
         Container(
           margin: const EdgeInsets.all(32),
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(14)),
-          child: const Text("This phone can't play this video's format.\nOpen it on the computer instead.", textAlign: TextAlign.center),
+          child: converting != null
+              ? Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text('Converting this video for this phone on ${widget.api.pairing.name}…', textAlign: TextAlign.center),
+                  const SizedBox(height: 12),
+                  LinearProgressIndicator(value: converting > 0 ? converting : null),
+                  const SizedBox(height: 6),
+                  Text(converting > 0 ? '${(converting * 100).round()}%' : 'Starting', style: Theme.of(context).textTheme.bodySmall),
+                ])
+              : Text('$_unplayable\nOpen it on the computer instead.', textAlign: TextAlign.center),
         ),
       ]);
     }

@@ -11,7 +11,7 @@ use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker};
 use objc2_av_foundation::{
-    AVAsset, AVAssetImageGenerator, AVAssetTrack, AVMediaTypeVideo, AVPlayer, AVPlayerItem, AVPlayerItemVideoOutput,
+    AVAsset, AVAssetExportPreset1920x1080, AVAssetExportSession, AVAssetExportSessionStatus, AVAssetImageGenerator, AVFileTypeMPEG4, AVAssetTrack, AVMediaTypeVideo, AVPlayer, AVPlayerItem, AVPlayerItemVideoOutput,
     AVURLAsset,
 };
 use objc2_core_foundation::{CFString, CGSize};
@@ -213,4 +213,26 @@ impl Drop for Player {
     fn drop(&mut self) {
         unsafe { self.player.pause() };
     }
+}
+
+/// H.264/AAC MP4 at 1080p at most, with AVFoundation's export (hardware encoding).
+pub fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<(), String> {
+    autoreleasepool(|_| unsafe {
+        let asset = asset(src);
+        let session = AVAssetExportSession::exportSessionWithAsset_presetName(&asset, AVAssetExportPreset1920x1080).ok_or("this video can't be converted")?;
+        session.setOutputURL(Some(&url(dst)));
+        session.setOutputFileType(AVFileTypeMPEG4);
+        session.setShouldOptimizeForNetworkUse(true);
+        session.exportAsynchronouslyWithCompletionHandler(&block2::RcBlock::new(|| {}));
+        loop {
+            match session.status() {
+                AVAssetExportSessionStatus::Completed => return Ok(()),
+                AVAssetExportSessionStatus::Failed | AVAssetExportSessionStatus::Cancelled => {
+                    return Err(session.error().map(|e| e.localizedDescription().to_string()).unwrap_or_else(|| "conversion failed".into()));
+                }
+                _ => progress(session.progress()),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    })
 }

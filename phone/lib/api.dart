@@ -248,6 +248,10 @@ class Api {
   /// A plain-HTTP link to the video for the player, signed for this one file.
   Future<String> mediaUrl(String id) async => (await getJson('/api/media-url/$id'))['url'] as String;
 
+  /// The video converted on the computer for phones that can't play it: `status` is `ready`
+  /// (with `url`), `converting` (with `progress`, 0–1) or `failed` (with `error`).
+  Future<Map<String, dynamic>> compat(String id) => getJson('/api/compat/$id');
+
   Future<void> favorite(String id, bool on) => _send('POST', '/api/favorite/$id', query: {'on': on ? '1' : '0'});
 
   /// Favourites (or not) several at once.

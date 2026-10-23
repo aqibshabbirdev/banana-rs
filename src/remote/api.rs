@@ -59,7 +59,13 @@ pub fn handle(shared: &Shared, req: &Request, body: &mut dyn Read, media_only: b
             None => Response::error(404, "no such photo"),
         },
         ("GET", "media-url", 3) => match item() {
-            Some(it) => media_url(shared, it, req),
+            Some(it) => media_url(shared, it, req, false),
+            None => Response::error(404, "no such photo"),
+        },
+        // A video the phone can't play, converted on the computer (see docs/phone-api.md).
+        ("GET", "compat", 3) => match item() {
+            Some(it) if it.is_video => compat(shared, it, req),
+            Some(_) => Response::error(400, "not a video"),
             None => Response::error(404, "no such photo"),
         },
         ("GET", "albums", 2) => Response::json(200, &albums(&lib)),
@@ -264,13 +270,26 @@ fn photo(it: &Item, req: &Request) -> Response {
 
 /// A link the phone's video player can open without headers: plain HTTP on the media port,
 /// signed for this one file, working for a few hours.
-fn media_url(shared: &Shared, it: &Item, req: &Request) -> Response {
+fn media_url(shared: &Shared, it: &Item, req: &Request, converted: bool) -> Response {
     let expires = chrono::Utc::now().timestamp() + MEDIA_LINK_TTL;
     let sig = shared.sign(it.id, expires);
     // The address the phone reached us on is one it can reach again.
     let host = req.header("Host").and_then(|h| h.rsplit_once(':').map(|(h, _)| h.to_string()).or(Some(h.to_string()))).unwrap_or_default();
-    let url = format!("http://{host}:{}/m/{:016x}?e={expires}&s={sig}", shared.media_port, it.id);
-    Response::json(200, &json!({ "url": url, "expires": expires }))
+    let variant = if converted { "&v=c" } else { "" };
+    let url = format!("http://{host}:{}/m/{:016x}?e={expires}&s={sig}{variant}", shared.media_port, it.id);
+    Response::json(200, &json!({ "status": "ready", "url": url, "expires": expires }))
+}
+
+/// The video converted to H.264 for phones that can't play it: a link once it's ready, else how
+/// far converting has got (it starts on the first ask).
+fn compat(shared: &Shared, it: &Item, req: &Request) -> Response {
+    if super::converted_path(it).is_some_and(|p| p.is_file()) {
+        return media_url(shared, it, req, true);
+    }
+    match shared.conversion(it) {
+        super::Conversion::Running(p) => Response::json(200, &json!({ "status": "converting", "progress": p })),
+        super::Conversion::Failed(e) => Response::json(200, &json!({ "status": "failed", "error": e })),
+    }
 }
 
 /// The media port: only signed links to one file each.
@@ -288,6 +307,10 @@ fn media(shared: &Shared, req: &Request) -> Response {
     }
     let lib = shared.library();
     match lib.by_id.get(&id).map(|&i| &lib.items[i]) {
+        Some(it) if req.param("v") == Some("c") => match super::converted_path(it).filter(|p| p.is_file()) {
+            Some(p) => Response::file(p, "video/mp4", req.header("Range")),
+            None => Response::error(404, "not converted (any more)"),
+        },
         Some(it) => Response::file(it.path.clone(), content_type(&it.path), req.header("Range")),
         None => Response::error(404, "no such photo"),
     }

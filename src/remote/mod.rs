@@ -125,6 +125,45 @@ pub struct Shared {
     events: Mutex<Sender<Event>>,
     ctx: egui::Context,
     search: Mutex<api::Search>,
+    /// Videos being converted for phones that can't play them (by id), shared with the
+    /// converting thread; one is converted at a time.
+    conversions: Arc<Mutex<HashMap<u64, Conversion>>>,
+    converting: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+pub enum Conversion {
+    /// Waiting its turn, or converting (0–1).
+    Running(f32),
+    Failed(String),
+}
+
+/// Where a video converted for phones is kept (it's made again if the video changes).
+pub fn converted_path(it: &Item) -> Option<PathBuf> {
+    let key = crate::thumbs::cache_key(&it.path, it.mtime, it.size);
+    Some(dirs::cache_dir()?.join("banana-rs").join("phone-videos").join(format!("{key:016x}.mp4")))
+}
+
+/// Keeps converted videos under 4 GB, dropping the ones made longest ago.
+fn prune_converted(dir: &Path) {
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    files.sort();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    for (_, len, path) in files {
+        if total <= 4 << 30 {
+            break;
+        }
+        let _ = std::fs::remove_file(path);
+        total -= len;
+    }
 }
 
 impl Shared {
@@ -172,6 +211,34 @@ impl Shared {
 
     fn remove_photos(&self, ids: &[u64]) {
         self.edit_library(|items| items.retain(|it| !ids.contains(&it.id)));
+    }
+
+    /// Where converting a video for phones stands; starts it the first time it's asked for.
+    fn conversion(&self, it: &Item) -> Conversion {
+        let mut all = self.conversions.lock().unwrap();
+        if let Some(c) = all.get(&it.id) {
+            return c.clone();
+        }
+        all.insert(it.id, Conversion::Running(0.0));
+        let (id, src, dst) = (it.id, it.path.clone(), converted_path(it));
+        let (conversions, converting) = (self.conversions.clone(), self.converting.clone());
+        std::thread::spawn(move || {
+            let _turn = converting.lock().unwrap();
+            let set = |c: Conversion| {
+                conversions.lock().unwrap().insert(id, c);
+            };
+            let Some(dst) = dst else { return set(Conversion::Failed("no cache folder".into())) };
+            match crate::video::convert_for_phone(&src, &dst, &|p| set(Conversion::Running(p))) {
+                Ok(()) => {
+                    conversions.lock().unwrap().remove(&id);
+                    if let Some(dir) = dst.parent() {
+                        prune_converted(dir);
+                    }
+                }
+                Err(e) => set(Conversion::Failed(e)),
+            }
+        });
+        Conversion::Running(0.0)
     }
 
     fn send(&self, e: Event) {
@@ -282,6 +349,8 @@ impl Remote {
             events: Mutex::new(tx),
             ctx,
             search: Mutex::new(api::Search::default()),
+            conversions: Arc::default(),
+            converting: Arc::default(),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let mut listeners = Vec::new();
@@ -658,6 +727,18 @@ mod tests {
         // No face picture made (no analysis ran).
         assert_eq!(status(get(&format!("/api/face/{}", people["people"][0]["id"].as_str().unwrap())).call()), 404);
         assert_eq!(status(get("/api/person/0123456789abcdef").call()), 404);
+
+        // Converting for phones: a file that isn't really a video ends as failed, and a photo is refused.
+        let mut compat = serde_json::Value::Null;
+        for _ in 0..100 {
+            compat = get(&format!("/api/compat/{video}")).call().unwrap().into_json().unwrap();
+            if compat["status"] != "converting" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(compat["status"], "failed", "{compat}");
+        assert_eq!(status(get(&format!("/api/compat/{beach}")).call()), 400);
 
         let found: serde_json::Value = get("/api/search?q=beach").call().unwrap().into_json().unwrap();
         assert_eq!((found["kind"].as_str(), found["ids"][0].as_str()), (Some("name"), Some(beach.as_str())));
