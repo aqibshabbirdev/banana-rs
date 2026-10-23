@@ -427,7 +427,7 @@ pub struct PhotosApp {
     remote: Option<remote::Remote>,
     remote_error: Option<String>,
     remote_qr: Option<(String, TextureHandle)>,
-    remote_sent: Option<(u64, usize, usize, usize)>,
+    remote_sent: Option<(u64, usize, usize, usize, u64)>,
     remote_rescan_at: Option<f64>,
     /// macOS: the 🍌 in the menu bar while phones can connect.
     #[cfg(target_os = "macos")]
@@ -3131,13 +3131,26 @@ impl PhotosApp {
             }
         }
         // Send the library again when it changed (cheap check; at most once a second while scanning).
-        let stamp = (self.gen, self.photos.len(), self.store.favorites.len(), self.store.archived.len());
+        let stamp = (self.gen, self.photos.len(), self.store.favorites.len(), self.store.archived.len(), self.albums_people_stamp());
         if self.remote_sent != Some(stamp) && (!self.scanning || self.photos.is_empty()) {
             self.remote_sent = Some(stamp);
             if let Some(r) = &self.remote {
-                r.set_library(remote::snapshot(self.root.clone(), &self.photos, &self.store));
+                r.set_library(remote::snapshot(self.root.clone(), &self.photos, &self.store, &self.people, &self.people_index));
             }
         }
+    }
+
+    /// Changes when albums or people change (names, members), so phones get them again.
+    fn albums_people_stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for a in &self.store.albums {
+            (&a.name, a.photos.len()).hash(&mut h);
+        }
+        for p in &self.people {
+            (&p.name, p.hidden, p.photos.len(), p.cover.index, &p.cover.path).hash(&mut h);
+        }
+        h.finish()
     }
 
     fn connect_page(&mut self, ui: &mut egui::Ui) {

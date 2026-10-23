@@ -116,6 +116,18 @@ The photo upright as JPEG, at most `max` pixels on the long side (64–8192, def
 
 `on=0` removes the favourite. → `{"favorite": true}`.
 
+### Albums and people
+
+`GET /api/albums` → `{"albums": [{"id": "0", "name": "Trip", "count": 42, "cover": "<photo id>"}]}`: the albums made on the computer.
+
+`GET /api/people` → `{"people": [{"id": "9f3b2c1d00aa7e41", "name": "Sara", "count": 120, "cover": "<photo id>"}]}`: the people the computer recognised (named first, then by how many photos; hidden ones left out). `name` is `null` for someone not named yet.
+
+`GET /api/album/<id>` and `GET /api/person/<id>` → `{"name": "...", "ids": ["...", "..."]}`: their photos, newest first.
+
+`GET /api/face/<person id>`: the person's round-avatar picture (a small square JPEG), `404` when there isn't one yet (show `cover` instead).
+
+Favourites need no call: they're the items with `"favorite": true`.
+
 ## 3. Video
 
 `GET /api/video/<id>` streams the file with `Range` support, over the pinned HTTPS client.

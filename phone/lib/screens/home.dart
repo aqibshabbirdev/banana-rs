@@ -9,6 +9,7 @@ import '../api.dart';
 import '../backup.dart';
 import '../library.dart';
 import 'backup.dart';
+import 'collections.dart';
 import 'photos.dart';
 import 'search.dart';
 
@@ -173,6 +174,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final pages = [
       PhotosPage(library: library, api: api, cache: cache),
       SearchPage(library: library, api: api, cache: cache),
+      CollectionsPage(library: library, api: api, cache: cache),
       BackupPage(backup: _backup, computer: widget.pairing.name),
     ];
     return Scaffold(
@@ -242,6 +244,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.photo_outlined), selectedIcon: Icon(Icons.photo), label: 'Photos'),
           NavigationDestination(icon: Icon(Icons.search), label: 'Search'),
+          NavigationDestination(icon: Icon(Icons.photo_album_outlined), selectedIcon: Icon(Icons.photo_album), label: 'Albums'),
           NavigationDestination(icon: Icon(Icons.backup_outlined), selectedIcon: Icon(Icons.backup), label: 'Backup'),
         ],
       ),

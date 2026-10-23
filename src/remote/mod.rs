@@ -54,6 +54,25 @@ pub struct Snapshot {
     pub by_id: HashMap<u64, usize>,
     /// Goes up with every change, so the phone can tell its list is stale.
     pub version: u64,
+    pub albums: Arc<Vec<Album>>,
+    /// People the computer recognised (not the hidden ones), most photos first.
+    pub people: Arc<Vec<Person>>,
+}
+
+pub struct Album {
+    pub name: String,
+    /// In timeline order (newest first).
+    pub ids: Vec<u64>,
+}
+
+pub struct Person {
+    /// Stable while the person keeps the same cover face.
+    pub id: u64,
+    pub name: Option<String>,
+    /// In timeline order (newest first).
+    pub ids: Vec<u64>,
+    /// The cover face's small square picture.
+    pub face: Option<PathBuf>,
 }
 
 pub fn photo_id(path: &Path) -> u64 {
@@ -118,7 +137,7 @@ impl Shared {
         let mut items = lib.items.clone();
         f(&mut items);
         let by_id = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
-        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1 });
+        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1, albums: lib.albums.clone(), people: lib.people.clone() });
     }
 
     /// A photo a phone just uploaded, so it shows on the phones before the app re-scans.
@@ -323,7 +342,13 @@ impl Drop for Remote {
 }
 
 /// Builds the list the phone browses from the app's photos.
-pub fn snapshot(root: Option<PathBuf>, photos: &[crate::library::Photo], store: &crate::store::Store) -> Snapshot {
+pub fn snapshot(
+    root: Option<PathBuf>,
+    photos: &[crate::library::Photo],
+    store: &crate::store::Store,
+    people: &[crate::people::Person],
+    analysis: &crate::people::Index,
+) -> Snapshot {
     let mut items: Vec<Item> = photos
         .iter()
         .filter(|p| !store.is_archived(&p.path))
@@ -340,8 +365,29 @@ pub fn snapshot(root: Option<PathBuf>, photos: &[crate::library::Photo], store: 
         })
         .collect();
     items.sort_by(|a, b| b.taken.cmp(&a.taken).then_with(|| a.path.cmp(&b.path)));
-    let by_id = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
-    Snapshot { root, items, by_id, version: 0 }
+    let by_id: HashMap<u64, usize> = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
+    // Photos as ids in timeline order, leaving out ones not in the timeline (archived, gone).
+    let ids = |paths: &mut dyn Iterator<Item = &PathBuf>| {
+        let mut at: Vec<usize> = paths.filter_map(|p| by_id.get(&photo_id(p)).copied()).collect();
+        at.sort_unstable();
+        at.dedup();
+        at.into_iter().map(|i| items[i].id).collect::<Vec<u64>>()
+    };
+    let albums = store.albums.iter().map(|a| Album { name: a.name.clone(), ids: ids(&mut a.photos.iter()) }).collect();
+    let mut people: Vec<Person> = people
+        .iter()
+        .filter(|p| !p.hidden)
+        .map(|p| Person {
+            id: photo_id(Path::new(&p.cover.key())),
+            name: p.name.clone(),
+            ids: ids(&mut p.photos.iter()),
+            face: analysis.entries.get(&p.cover.path).and_then(|a| crate::people::crop_path(&p.cover.path, a.mtime, a.size, p.cover.index)),
+        })
+        .filter(|p| !p.ids.is_empty())
+        .collect();
+    // Named people first, then by how many photos they're in.
+    people.sort_by(|a, b| b.name.is_some().cmp(&a.name.is_some()).then(b.ids.len().cmp(&a.ids.len())).then(a.id.cmp(&b.id)));
+    Snapshot { root, items, by_id, version: 0, albums: Arc::new(albums), people: Arc::new(people) }
 }
 
 fn dir() -> Option<PathBuf> {
@@ -508,7 +554,18 @@ mod tests {
         let photos: Vec<crate::library::Photo> = ["beach.jpg", "clip.mp4"].iter().filter_map(|n| crate::library::read_photo(&root.join(n))).collect();
 
         let r = Remote::start_on(egui::Context::default(), 0, 0).unwrap();
-        r.set_library(snapshot(Some(root.clone()), &photos, &crate::store::Store::default()));
+        let mut store = crate::store::Store::default();
+        store.create_album("Holiday", &[root.join("clip.mp4"), root.join("beach.jpg")]);
+        let face = |path: &str| crate::people::FaceRef { path: root.join(path), index: 0 };
+        let person = |name: Option<&str>, hidden: bool| crate::people::Person {
+            name: name.map(String::from),
+            hidden,
+            faces: vec![face("beach.jpg")],
+            photos: [root.join("beach.jpg")].into(),
+            cover: face("beach.jpg"),
+        };
+        let people = [person(Some("Sara"), false), person(None, true)];
+        r.set_library(snapshot(Some(root.clone()), &photos, &store, &people, &crate::people::Index::default()));
         let url = |p: &str| format!("https://127.0.0.1:{}{p}", r.shared.port);
         let a = agent(&r.shared.fingerprint);
 
@@ -551,6 +608,22 @@ mod tests {
         assert_eq!(ureq::get(&link).call().unwrap().into_string().unwrap(), "0123456789");
         assert_eq!(status(ureq::get(&link.replace(&video, &beach)).call()), 403);
         assert_eq!(status(ureq::get(&url("/api/info").replace("https", "http").replace(&r.shared.port.to_string(), &r.shared.media_port.to_string())).call()), 404);
+
+        // Albums and people, in timeline order; unknown ones are 404s; hidden people aren't listed.
+        let albums: serde_json::Value = get("/api/albums").call().unwrap().into_json().unwrap();
+        assert_eq!((albums["albums"][0]["name"].as_str(), albums["albums"][0]["count"].as_u64()), (Some("Holiday"), Some(2)));
+        let holiday: serde_json::Value = get("/api/album/0").call().unwrap().into_json().unwrap();
+        let first_two: Vec<_> = list["items"].as_array().unwrap().iter().map(|i| i["id"].clone()).collect();
+        assert_eq!(holiday["ids"].as_array().unwrap(), &first_two);
+        assert_eq!(status(get("/api/album/7").call()), 404);
+        let people: serde_json::Value = get("/api/people").call().unwrap().into_json().unwrap();
+        assert_eq!(people["people"].as_array().map(Vec::len), Some(1));
+        assert_eq!((people["people"][0]["name"].as_str(), people["people"][0]["count"].as_u64()), (Some("Sara"), Some(1)));
+        let sara: serde_json::Value = get(&format!("/api/person/{}", people["people"][0]["id"].as_str().unwrap())).call().unwrap().into_json().unwrap();
+        assert_eq!(sara["ids"][0].as_str(), Some(beach.as_str()));
+        // No face picture made (no analysis ran).
+        assert_eq!(status(get(&format!("/api/face/{}", people["people"][0]["id"].as_str().unwrap())).call()), 404);
+        assert_eq!(status(get("/api/person/0123456789abcdef").call()), 404);
 
         let found: serde_json::Value = get("/api/search?q=beach").call().unwrap().into_json().unwrap();
         assert_eq!((found["kind"].as_str(), found["ids"][0].as_str()), (Some("name"), Some(beach.as_str())));

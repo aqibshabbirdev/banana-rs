@@ -62,6 +62,24 @@ pub fn handle(shared: &Shared, req: &Request, body: &mut dyn Read, media_only: b
             Some(it) => media_url(shared, it, req),
             None => Response::error(404, "no such photo"),
         },
+        ("GET", "albums", 2) => Response::json(200, &albums(&lib)),
+        ("GET", "album", 3) => match parts[2].parse::<usize>().ok().and_then(|i| lib.albums.get(i)) {
+            Some(a) => Response::json(200, &json!({ "name": a.name, "ids": hex_ids(&a.ids) })),
+            None => Response::error(404, "no such album"),
+        },
+        ("GET", "people", 2) => Response::json(200, &people(&lib)),
+        ("GET", "person", 3) => match person(&lib, parts[2]) {
+            Some(p) => Response::json(200, &json!({ "name": p.name, "ids": hex_ids(&p.ids) })),
+            None => Response::error(404, "no such person"),
+        },
+        ("GET" | "HEAD", "face", 3) => match person(&lib, parts[2]).and_then(|p| p.face.clone()).filter(|f| f.is_file()) {
+            Some(f) => {
+                let mut r = Response::file(f, "image/jpeg", None);
+                r.headers.push(("Cache-Control".into(), "private, max-age=31536000, immutable".into()));
+                r
+            }
+            None => Response::error(404, "no face picture"),
+        },
         ("GET", "search", 2) => search(shared, &lib, req.param("q").unwrap_or("")),
         ("GET", "has", 2) => has(&lib, &phone.name, req),
         ("POST", "upload", 2) => upload(shared, &lib, &phone.name, req, body),
@@ -140,6 +158,34 @@ fn thumb(it: &Item) -> Response {
         }
         None => Response::error(404, "no thumbnail"),
     }
+}
+
+fn hex_ids(ids: &[u64]) -> Vec<String> {
+    ids.iter().map(|id| format!("{id:016x}")).collect()
+}
+
+fn albums(lib: &Snapshot) -> serde_json::Value {
+    let list: Vec<_> = lib
+        .albums
+        .iter()
+        .enumerate()
+        .map(|(i, a)| json!({ "id": i.to_string(), "name": a.name, "count": a.ids.len(), "cover": a.ids.first().map(|id| format!("{id:016x}")) }))
+        .collect();
+    json!({ "albums": list })
+}
+
+fn people(lib: &Snapshot) -> serde_json::Value {
+    let list: Vec<_> = lib
+        .people
+        .iter()
+        .map(|p| json!({ "id": format!("{:016x}", p.id), "name": p.name, "count": p.ids.len(), "cover": p.ids.first().map(|id| format!("{id:016x}")) }))
+        .collect();
+    json!({ "people": list })
+}
+
+fn person<'a>(lib: &'a Snapshot, id: &str) -> Option<&'a super::Person> {
+    let id = u64::from_str_radix(id, 16).ok()?;
+    lib.people.iter().find(|p| p.id == id)
 }
 
 /// The photo upright as JPEG, at most `max` pixels on its long side (2048 by default), so HEIC
