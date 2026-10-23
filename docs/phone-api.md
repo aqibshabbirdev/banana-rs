@@ -133,6 +133,8 @@ Several at once, with a JSON body `{"ids": ["...", "..."]}` (favorites also take
 
 `GET /api/face/<person id>`: the person's round-avatar picture (a small square JPEG), `404` when there isn't one yet (show `cover` instead).
 
+`GET /api/places` → `{"places": [{"id": "1172451", "name": "Lahore, Pakistan", "count": 230, "cover": "<photo id>"}]}`: the towns photos were taken in (from their GPS, named offline on the computer), most photos first. `GET /api/place/<id>` → `{"name": "...", "ids": [...]}`.
+
 Favourites need no call: they're the items with `"favorite": true`.
 
 ## 3. Video

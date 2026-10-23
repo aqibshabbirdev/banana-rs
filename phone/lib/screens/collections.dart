@@ -1,4 +1,5 @@
-// The Albums tab: Favourites, the people the computer recognised, and the albums made there.
+// The Albums tab: Favourites, the people the computer recognised, the places photos were taken
+// in, and the albums made there.
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
@@ -20,7 +21,7 @@ class CollectionsPage extends StatefulWidget {
 }
 
 class _CollectionsPageState extends State<CollectionsPage> {
-  List<Map<String, dynamic>>? _albums, _people;
+  List<Map<String, dynamic>>? _albums, _people, _places;
   Object? _error;
 
   /// The library version they were fetched for: fetched again when the computer's changes.
@@ -49,11 +50,12 @@ class _CollectionsPageState extends State<CollectionsPage> {
     _loading = true;
     final version = widget.library.version;
     try {
-      final got = await Future.wait([widget.api.albums(), widget.api.people()]);
+      final got = await Future.wait([widget.api.albums(), widget.api.people(), widget.api.places()]);
       if (!mounted) return;
       setState(() {
         _albums = got[0];
         _people = got[1];
+        _places = got[2];
         _error = null;
         _for = version;
       });
@@ -105,7 +107,7 @@ class _CollectionsPageState extends State<CollectionsPage> {
       listenable: widget.library,
       builder: (context, _) {
         final favorites = widget.library.items.where((i) => i.favorite).toList();
-        final people = _people ?? [], albums = _albums ?? [];
+        final people = _people ?? [], albums = _albums ?? [], places = _places ?? [];
         return RefreshIndicator(
           onRefresh: _load,
           child: ListView(padding: const EdgeInsets.symmetric(vertical: 12), children: [
@@ -137,6 +139,19 @@ class _CollectionsPageState extends State<CollectionsPage> {
                 ),
               ),
             ],
+            if (places.isNotEmpty) ...[
+              Padding(padding: const EdgeInsets.fromLTRB(16, 20, 16, 10), child: Text('Places', style: t.titleMedium)),
+              SizedBox(
+                height: 150,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  itemCount: places.length,
+                  separatorBuilder: (_, _) => const SizedBox(width: 12),
+                  itemBuilder: (context, i) => _placeTile(places[i], t),
+                ),
+              ),
+            ],
             if (albums.isNotEmpty) ...[
               Padding(padding: const EdgeInsets.fromLTRB(16, 20, 16, 10), child: Text('Albums', style: t.titleMedium)),
               GridView.count(
@@ -150,10 +165,10 @@ class _CollectionsPageState extends State<CollectionsPage> {
                 children: [for (final a in albums) _albumTile(a, t)],
               ),
             ],
-            if (_albums != null && albums.isEmpty && people.isEmpty)
+            if (_albums != null && albums.isEmpty && people.isEmpty && places.isEmpty)
               Padding(
                 padding: const EdgeInsets.all(16),
-                child: Text('Albums you make on the computer, and the people it recognises, show here.', style: t.bodyMedium?.copyWith(color: Colors.white70)),
+                child: Text('Albums you make on the computer, the people it recognises and the places photos were taken show here.', style: t.bodyMedium?.copyWith(color: Colors.white70)),
               ),
           ]),
         );
@@ -187,6 +202,25 @@ class _CollectionsPageState extends State<CollectionsPage> {
           const SizedBox(height: 6),
           Text(name ?? 'Unnamed', style: t.bodySmall?.copyWith(color: name == null ? Colors.white54 : null), overflow: TextOverflow.ellipsis),
           Text('${p['count']}', style: t.labelSmall?.copyWith(color: Colors.white54)),
+        ]),
+      ),
+    );
+  }
+
+  /// "Lahore" over its cover, with "Pakistan · 120" under it.
+  Widget _placeTile(Map<String, dynamic> p, TextTheme t) {
+    final name = p['name'] as String;
+    final comma = name.indexOf(', ');
+    final (town, country) = comma < 0 ? (name, '') : (name.substring(0, comma), name.substring(comma + 2));
+    return InkWell(
+      onTap: () => _openMembers('place', p, name),
+      child: SizedBox(
+        width: 104,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          ClipRRect(borderRadius: BorderRadius.circular(10), child: SizedBox(width: 104, height: 104, child: _cover(p['cover'] as String?))),
+          const SizedBox(height: 6),
+          Text(town, style: t.bodySmall, overflow: TextOverflow.ellipsis),
+          Text(country.isEmpty ? '${p['count']}' : '$country · ${p['count']}', style: t.labelSmall?.copyWith(color: Colors.white54), overflow: TextOverflow.ellipsis),
         ]),
       ),
     );

@@ -238,9 +238,10 @@ class Api {
 
   /// Albums and people: `id`, `name` (null for an unnamed person), `count`, `cover` (a photo id).
   Future<List<Map<String, dynamic>>> albums() async => ((await getJson('/api/albums'))['albums'] as List).cast<Map<String, dynamic>>();
+  Future<List<Map<String, dynamic>>> places() async => ((await getJson('/api/places'))['places'] as List).cast<Map<String, dynamic>>();
   Future<List<Map<String, dynamic>>> people() async => ((await getJson('/api/people'))['people'] as List).cast<Map<String, dynamic>>();
 
-  /// The photos of an album or person (`album` or `person`), newest first.
+  /// The photos of an album, person or place (`album`, `person`, `place`), newest first.
   Future<List<String>> members(String kind, String id) async => ((await getJson('/api/$kind/$id'))['ids'] as List).cast<String>();
 
   String faceUrl(String personId) => uri('/api/face/$personId').toString();

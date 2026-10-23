@@ -74,6 +74,18 @@ pub fn handle(shared: &Shared, req: &Request, body: &mut dyn Read, media_only: b
             None => Response::error(404, "no such album"),
         },
         ("GET", "people", 2) => Response::json(200, &people(&lib)),
+        ("GET", "places", 2) => {
+            let list: Vec<_> = lib
+                .places
+                .iter()
+                .map(|p| json!({ "id": p.id.to_string(), "name": p.name, "count": p.ids.len(), "cover": p.ids.first().map(|id| format!("{id:016x}")) }))
+                .collect();
+            Response::json(200, &json!({ "places": list }))
+        }
+        ("GET", "place", 3) => match parts[2].parse::<u32>().ok().and_then(|id| lib.places.iter().find(|p| p.id == id)) {
+            Some(p) => Response::json(200, &json!({ "name": p.name, "ids": hex_ids(&p.ids) })),
+            None => Response::error(404, "no such place"),
+        },
         ("GET", "person", 3) => match person(&lib, parts[2]) {
             Some(p) => Response::json(200, &json!({ "name": p.name, "ids": hex_ids(&p.ids) })),
             None => Response::error(404, "no such person"),

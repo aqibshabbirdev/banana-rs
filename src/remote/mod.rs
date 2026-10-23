@@ -57,6 +57,16 @@ pub struct Snapshot {
     pub albums: Arc<Vec<Album>>,
     /// People the computer recognised (not the hidden ones), most photos first.
     pub people: Arc<Vec<Person>>,
+    /// Towns photos were taken in (see places.rs), most photos first.
+    pub places: Arc<Vec<Place>>,
+}
+
+pub struct Place {
+    /// The town's id in places.rs.
+    pub id: u32,
+    pub name: String,
+    /// In timeline order (newest first).
+    pub ids: Vec<u64>,
 }
 
 pub struct Album {
@@ -178,7 +188,7 @@ impl Shared {
         let mut items = lib.items.clone();
         f(&mut items);
         let by_id = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
-        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1, albums: lib.albums.clone(), people: lib.people.clone() });
+        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1, albums: lib.albums.clone(), people: lib.people.clone(), places: lib.places.clone() });
     }
 
     /// A photo a phone just uploaded, so it shows on the phones before the app re-scans.
@@ -462,7 +472,15 @@ pub fn snapshot(
         .collect();
     // Named people first, then by how many photos they're in.
     people.sort_by(|a, b| b.name.is_some().cmp(&a.name.is_some()).then(b.ids.len().cmp(&a.ids.len())).then(a.id.cmp(&b.id)));
-    Snapshot { root, items, by_id, version: 0, albums: Arc::new(albums), people: Arc::new(people) }
+    let mut by_place: HashMap<u32, Vec<PathBuf>> = HashMap::new();
+    for p in photos.iter().filter(|p| !store.is_archived(&p.path)) {
+        if let Some(place) = p.gps.and_then(|(lat, lon)| crate::places::nearest(lat, lon)) {
+            by_place.entry(place).or_default().push(p.path.clone());
+        }
+    }
+    let mut places: Vec<Place> = by_place.into_iter().map(|(id, paths)| Place { id, name: crate::places::name(id), ids: ids(&mut paths.iter()) }).collect();
+    places.sort_by(|a, b| b.ids.len().cmp(&a.ids.len()).then_with(|| a.name.cmp(&b.name)));
+    Snapshot { root, items, by_id, version: 0, albums: Arc::new(albums), people: Arc::new(people), places: Arc::new(places) }
 }
 
 fn dir() -> Option<PathBuf> {
@@ -654,7 +672,9 @@ mod tests {
         std::env::set_var("BANANA_DATA", &data);
         std::fs::write(root.join("beach.jpg"), jpeg(400, 300, 10)).unwrap();
         std::fs::write(root.join("clip.mp4"), b"0123456789").unwrap();
-        let photos: Vec<crate::library::Photo> = ["beach.jpg", "clip.mp4"].iter().filter_map(|n| crate::library::read_photo(&root.join(n))).collect();
+        let mut photos: Vec<crate::library::Photo> = ["beach.jpg", "clip.mp4"].iter().filter_map(|n| crate::library::read_photo(&root.join(n))).collect();
+        // Taken in Lahore.
+        photos.iter_mut().find(|p| p.path.ends_with("beach.jpg")).unwrap().gps = Some((31.52, 74.36));
 
         let r = Remote::start_on(egui::Context::default(), 0, 0).unwrap();
         let mut store = crate::store::Store::default();
@@ -727,6 +747,10 @@ mod tests {
         // No face picture made (no analysis ran).
         assert_eq!(status(get(&format!("/api/face/{}", people["people"][0]["id"].as_str().unwrap())).call()), 404);
         assert_eq!(status(get("/api/person/0123456789abcdef").call()), 404);
+        let places: serde_json::Value = get("/api/places").call().unwrap().into_json().unwrap();
+        assert_eq!((places["places"][0]["name"].as_str(), places["places"][0]["count"].as_u64()), (Some("Lahore, Pakistan"), Some(1)));
+        let lahore: serde_json::Value = get(&format!("/api/place/{}", places["places"][0]["id"].as_str().unwrap())).call().unwrap().into_json().unwrap();
+        assert_eq!(lahore["ids"][0].as_str(), Some(beach.as_str()));
 
         // Converting for phones: a file that isn't really a video ends as failed, and a photo is refused.
         let mut compat = serde_json::Value::Null;
