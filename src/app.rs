@@ -3346,6 +3346,13 @@ impl PhotosApp {
                     self.store.set_favorite(&path, on);
                     favorites_changed = true;
                 }
+                remote::Event::SyncMeta(meta) => {
+                    if let Some(root) = self.root.clone() {
+                        meta.apply_to(&root, &mut self.store);
+                        favorites_changed = true;
+                        self.people_dirty = true;
+                    }
+                }
                 remote::Event::Trashed(gone) => {
                     for (path, mtime, size) in &gone {
                         self.forget_photo(path, *mtime, *size);

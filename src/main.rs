@@ -15,6 +15,7 @@ mod people;
 mod places;
 mod remote;
 mod store;
+mod sync;
 mod thumbs;
 mod transfer;
 mod vault;

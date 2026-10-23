@@ -59,6 +59,10 @@ pub struct Snapshot {
     pub people: Arc<Vec<Person>>,
     /// Towns photos were taken in (see places.rs), most photos first.
     pub places: Arc<Vec<Place>>,
+    /// For computers syncing with this one: every file in the folder (archived ones too), as
+    /// (path inside the folder, size), and favourites, albums and names the same way.
+    pub files: Arc<Vec<(String, u64)>>,
+    pub meta: Arc<crate::sync::Meta>,
 }
 
 pub struct Place {
@@ -85,6 +89,21 @@ pub struct Person {
     pub face: Option<PathBuf>,
 }
 
+/// A copy of a snapshot (its big parts are shared), to change one part.
+fn clone_snapshot(s: &Snapshot) -> Snapshot {
+    Snapshot {
+        root: s.root.clone(),
+        items: s.items.clone(),
+        by_id: s.by_id.clone(),
+        version: s.version,
+        albums: s.albums.clone(),
+        people: s.people.clone(),
+        places: s.places.clone(),
+        files: s.files.clone(),
+        meta: s.meta.clone(),
+    }
+}
+
 pub fn photo_id(path: &Path) -> u64 {
     crate::thumbs::cache_key(path, 0, 0)
 }
@@ -97,6 +116,8 @@ pub enum Event {
     Favorite(PathBuf, bool),
     /// Moved to the Trash from a phone (path, mtime, size): forget them and re-scan.
     Trashed(Vec<(PathBuf, u64, u64)>),
+    /// Favourites, archive, albums and names after a sync with another computer: take them on.
+    SyncMeta(crate::sync::Meta),
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -106,6 +127,9 @@ pub struct Phone {
     token_hash: String,
     pub paired: i64,
     pub last_seen: i64,
+    /// Another computer syncing with this one (Connect → Computers), not a phone.
+    #[serde(default)]
+    pub computer: bool,
 }
 
 impl Phone {
@@ -117,6 +141,8 @@ impl Phone {
 
 struct Pairing {
     code: String,
+    /// What a computer types instead of scanning: six digits.
+    pin: String,
     until: Instant,
     misses: u32,
 }
@@ -188,7 +214,7 @@ impl Shared {
         let mut items = lib.items.clone();
         f(&mut items);
         let by_id = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
-        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1, albums: lib.albums.clone(), people: lib.people.clone(), places: lib.places.clone() });
+        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1, albums: lib.albums.clone(), people: lib.people.clone(), places: lib.places.clone(), files: lib.files.clone(), meta: lib.meta.clone() });
     }
 
     /// A photo a phone just uploaded, so it shows on the phones before the app re-scans.
@@ -209,6 +235,15 @@ impl Shared {
             let at = items.partition_point(|it| it.taken > item.taken);
             items.insert(at, item);
         });
+        // And to the files a syncing computer sees.
+        let mut lib = self.library.write().unwrap();
+        if let Some(rel) = lib.root.as_ref().and_then(|r| crate::sync::rel(r, &photo.path)) {
+            let mut files = lib.files.as_ref().clone();
+            files.retain(|(r, _)| r != &rel);
+            files.push((rel, photo.size));
+            let next = Snapshot { files: Arc::new(files), ..clone_snapshot(&lib) };
+            *lib = Arc::new(next);
+        }
     }
 
     fn set_favorite(&self, id: u64, on: bool) {
@@ -273,14 +308,15 @@ impl Shared {
     }
 
     /// Trades the QR code's pairing code for a token. Returns None for a wrong or expired code.
-    fn pair(&self, code: &str, phone_name: &str) -> Option<String> {
+    fn pair(&self, code: &str, phone_name: &str, computer: bool) -> Option<String> {
         let mut pairing = self.pairing.lock().unwrap();
         let p = pairing.as_mut()?;
         if Instant::now() > p.until {
             *pairing = None;
             return None;
         }
-        if !constant_time_eq(p.code.as_bytes(), code.as_bytes()) {
+        let right = constant_time_eq(p.code.as_bytes(), code.as_bytes()) || (computer && constant_time_eq(p.pin.as_bytes(), code.as_bytes()));
+        if !right {
             p.misses += 1;
             if p.misses >= PAIRING_TRIES {
                 *pairing = None;
@@ -293,9 +329,9 @@ impl Shared {
         let token = random_hex(32);
         let now = chrono::Utc::now().timestamp();
         let name: String = phone_name.chars().filter(|c| !c.is_control()).take(60).collect::<String>().trim().to_string();
-        let name = if name.is_empty() { "Phone".to_string() } else { name };
+        let name = if name.is_empty() { (if computer { "Computer" } else { "Phone" }).to_string() } else { name };
         let mut phones = self.phones.lock().unwrap();
-        phones.push(Phone { name: name.clone(), token_hash: hex(&Sha256::digest(token.as_bytes())), paired: now, last_seen: now });
+        phones.push(Phone { name: name.clone(), token_hash: hex(&Sha256::digest(token.as_bytes())), paired: now, last_seen: now, computer });
         save_phones(&phones);
         drop(phones);
         self.send(Event::Paired(name));
@@ -325,7 +361,7 @@ impl Remote {
         Self::start_on(ctx, PORT, MEDIA_PORT)
     }
 
-    fn start_on(ctx: egui::Context, port: u16, media_port: u16) -> Result<Self, String> {
+    pub(crate) fn start_on(ctx: egui::Context, port: u16, media_port: u16) -> Result<Self, String> {
         let (cert, key) = load_or_make_cert()?;
         let fingerprint = hex(&Sha256::digest(&cert));
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -383,8 +419,16 @@ impl Remote {
     /// A fresh one-time code for the QR code; the previous one stops working.
     pub fn new_pairing_code(&self) -> String {
         let code = random_hex(8);
-        *self.shared.pairing.lock().unwrap() = Some(Pairing { code: code.clone(), until: Instant::now() + PAIRING_TTL, misses: 0 });
+        let mut n = [0u8; 4];
+        getrandom::getrandom(&mut n).expect("the OS random source works");
+        let pin = format!("{:06}", u32::from_le_bytes(n) % 1_000_000);
+        *self.shared.pairing.lock().unwrap() = Some(Pairing { code: code.clone(), pin, until: Instant::now() + PAIRING_TTL, misses: 0 });
         code
+    }
+
+    /// The six digits another computer can pair with while the current code is valid.
+    pub fn pairing_pin(&self) -> Option<String> {
+        self.shared.pairing.lock().unwrap().as_ref().filter(|p| Instant::now() < p.until).map(|p| p.pin.clone())
     }
 
     /// What the QR code holds: everything the phone needs to find and trust this computer.
@@ -480,7 +524,11 @@ pub fn snapshot(
     }
     let mut places: Vec<Place> = by_place.into_iter().map(|(id, paths)| Place { id, name: crate::places::name(id), ids: ids(&mut paths.iter()) }).collect();
     places.sort_by(|a, b| b.ids.len().cmp(&a.ids.len()).then_with(|| a.name.cmp(&b.name)));
-    Snapshot { root, items, by_id, version: 0, albums: Arc::new(albums), people: Arc::new(people), places: Arc::new(places) }
+    let (files, meta) = match &root {
+        Some(r) => (photos.iter().filter_map(|p| Some((crate::sync::rel(r, &p.path)?, p.size))).collect(), crate::sync::Meta::from_store(r, store)),
+        None => (Vec::new(), crate::sync::Meta::default()),
+    };
+    Snapshot { root, items, by_id, version: 0, albums: Arc::new(albums), people: Arc::new(people), places: Arc::new(places), files: Arc::new(files), meta: Arc::new(meta) }
 }
 
 fn dir() -> Option<PathBuf> {
@@ -589,6 +637,7 @@ fn computer_name() -> String {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .unwrap_or_else(|| "Banana Photos".to_string())
 }
 
@@ -606,45 +655,52 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+
+/// Trusts exactly one certificate, by its SHA-256, as the phone app does after the QR scan (and
+/// another computer, syncing with this one).
+#[derive(Debug)]
+struct Pinned(String, Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for Pinned {
+    fn verify_server_cert(&self, cert: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        if hex(&Sha256::digest(cert.as_ref())) == self.0 {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("not the paired computer".into()))
+        }
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.1.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.1.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.1.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// An HTTPS client for the computer with this certificate fingerprint.
+pub fn pinned_agent(fingerprint: &str) -> ureq::Agent {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Pinned(fingerprint.to_string(), provider)))
+        .with_no_client_auth();
+    ureq::AgentBuilder::new().tls_config(Arc::new(config)).timeout_connect(Duration::from_secs(5)).build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, SignatureScheme};
-
-    /// Trusts exactly one certificate, by its SHA-256, as the phone app does after the QR scan.
-    #[derive(Debug)]
-    struct Pinned(String, Arc<rustls::crypto::CryptoProvider>);
-
-    impl ServerCertVerifier for Pinned {
-        fn verify_server_cert(&self, cert: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
-            if hex(&Sha256::digest(cert.as_ref())) == self.0 {
-                Ok(ServerCertVerified::assertion())
-            } else {
-                Err(rustls::Error::General("not the paired computer".into()))
-            }
-        }
-        fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(m, c, d, &self.1.signature_verification_algorithms)
-        }
-        fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(m, c, d, &self.1.signature_verification_algorithms)
-        }
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.1.signature_verification_algorithms.supported_schemes()
-        }
-    }
 
     fn agent(fingerprint: &str) -> ureq::Agent {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(Pinned(fingerprint.to_string(), provider)))
-            .with_no_client_auth();
-        ureq::AgentBuilder::new().tls_config(Arc::new(config)).build()
+        pinned_agent(fingerprint)
     }
 
     fn status(r: Result<ureq::Response, ureq::Error>) -> u16 {
@@ -814,6 +870,9 @@ mod tests {
             let has: serde_json::Value = get("/api/has?name=clip.mp4&size=10&taken=1700000000").call().unwrap().into_json().unwrap();
             assert_eq!(has["have"], true);
         }
+
+        // Syncing is for computers only.
+        assert_eq!(status(get("/api/sync/state").call()), 403);
 
         // Removing the phone on the computer cuts it off at once.
         let key = r.phones()[0].key().to_string();

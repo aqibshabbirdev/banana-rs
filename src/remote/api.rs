@@ -126,7 +126,74 @@ pub fn handle(shared: &Shared, req: &Request, body: &mut dyn Read, media_only: b
             Some(v) => trash(shared, &items_of(&lib, &v)),
             None => Response::error(400, "needs {\"ids\": [...]}"),
         },
+        ("GET" | "POST", "sync", 3) if !phone.computer => Response::error(403, "only computers sync"),
+        ("GET", "sync", 3) if parts[2] == "state" => Response::json(200, &json!({ "name": shared.name, "files": lib.files.as_slice(), "meta": lib.meta.as_ref() })),
+        ("GET" | "HEAD", "sync", 3) if parts[2] == "file" => match sync_path(&lib, req) {
+            Some(p) if p.is_file() => Response::file(p.clone(), content_type(&p), req.header("Range")),
+            _ => Response::error(404, "no such file"),
+        },
+        ("POST", "sync", 3) if parts[2] == "upload" => sync_upload(shared, &lib, &phone.name, req, body),
+        ("POST", "sync", 3) if parts[2] == "meta" => match read_json(body, req.body_len).and_then(|v| serde_json::from_value::<crate::sync::Meta>(v).ok()) {
+            Some(meta) => {
+                shared.send(Event::SyncMeta(meta));
+                Response::json(200, &json!({ "ok": true }))
+            }
+            None => Response::error(400, "needs the metadata"),
+        },
         _ => Response::error(404, "no such route"),
+    }
+}
+
+/// The file `?path=a/b.jpg` names in the library folder (only ones the library lists).
+fn sync_path(lib: &Snapshot, req: &Request) -> Option<PathBuf> {
+    let rel = req.param("path")?;
+    lib.files.iter().any(|(r, _)| r == rel).then(|| crate::sync::abs(lib.root.as_ref()?, rel)).flatten()
+}
+
+/// A file from the computer syncing with this one, put at the same path in this library. One
+/// that's here already (or was deleted here) is skipped; a different file at that path is
+/// kept, and this one is saved next to it as "name (from <computer>).ext".
+fn sync_upload(shared: &Shared, lib: &Snapshot, from: &str, req: &Request, body: &mut dyn Read) -> Response {
+    let (Some(root), Some(rel)) = (lib.root.as_ref(), req.param("path")) else { return Response::error(400, "needs path") };
+    let Some(mut dest) = crate::sync::abs(root, rel) else { return Response::error(400, "bad path") };
+    let name = dest.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    if !crate::transfer::is_media(&dest) {
+        return Response::error(415, "not a photo or video");
+    }
+    if req.body_len == 0 || req.body_len > MAX_UPLOAD {
+        return Response::error(413, "needs a size (not too big)");
+    }
+    let same_here = std::fs::metadata(&dest).is_ok_and(|m| m.len() == req.body_len);
+    if same_here || super::was_deleted(&name, req.body_len) || in_library(lib, &name, req.body_len) {
+        // Read and drop the body, so the connection stays usable.
+        let _ = std::io::copy(&mut body.take(req.body_len), &mut std::io::sink());
+        return Response::json(200, &json!({ "status": "skipped" }));
+    }
+    if dest.exists() {
+        let stem = dest.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        dest.set_file_name(format!("{stem} (from {from}){ext}"));
+    }
+    let part = dest.with_extension("banana-part");
+    let written = (|| {
+        std::fs::create_dir_all(dest.parent().ok_or_else(|| std::io::Error::other("no folder"))?)?;
+        let mut f = std::fs::File::create(&part)?;
+        let n = std::io::copy(&mut body.take(req.body_len), &mut f)?;
+        f.sync_all()?;
+        Ok::<u64, std::io::Error>(n)
+    })();
+    match written {
+        Ok(n) if n == req.body_len && std::fs::rename(&part, &dest).is_ok() => {
+            if let Some(photo) = crate::library::read_photo(&dest) {
+                shared.add_photo(&photo);
+            }
+            shared.send(Event::Uploaded);
+            Response::json(200, &json!({ "status": "imported" }))
+        }
+        _ => {
+            let _ = std::fs::remove_file(&part);
+            Response::error(500, "couldn't save it")
+        }
     }
 }
 
@@ -182,8 +249,8 @@ fn pair(shared: &Shared, body: &mut dyn Read, len: u64) -> Response {
         return Response::error(400, "unreadable body");
     }
     let v: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-    let (code, name) = (v["code"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""));
-    match shared.pair(code, name) {
+    let (code, name, computer) = (v["code"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""), v["computer"].as_bool().unwrap_or(false));
+    match shared.pair(code, name, computer) {
         Some(token) => Response::json(200, &json!({ "token": token, "name": shared.name, "fingerprint": shared.fingerprint })),
         None => Response::error(403, "wrong or expired code: open Connect phone on the computer and scan the new QR code"),
     }
