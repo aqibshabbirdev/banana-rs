@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
   push:
     branches: [production]
-    paths: ["src/**", "Cargo.*", "build.rs", "assets/**", "tests/**", ".github/workflows/windows.yml", "scripts/*windows*"]
+    paths: ["src/**", "Cargo.*", "build.rs", "assets/**", "tests/**", ".github/workflows/windows.yml", "scripts/*windows*", "scripts/msix/**"]
 
 jobs:
   build:
@@ -46,9 +46,40 @@ jobs:
           choco install innosetup -y --no-progress | Out-Null
           & "${env:ProgramFiles(x86)}\Inno Setup 6\iscc.exe" /Q "/DVersion=$version" "/DSource=$pwd\dist\win" scripts/windows-installer.iss
           Get-ChildItem dist/*.zip, dist/*.exe | Format-Table Name, Length
+      - name: MSIX (Microsoft Store)
+        env:
+          # From Partner Center (Product management › Product identity), as repository variables.
+          MSIX_NAME: ${{ vars.MSIX_NAME || 'BananaPhotos.Test' }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER || 'CN=Banana Photos Test' }}
+          MSIX_PUBLISHER_DISPLAY: ${{ vars.MSIX_PUBLISHER_DISPLAY || 'Banana Photos (test)' }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $layout = "dist/msix-layout"
+          New-Item -ItemType Directory -Force "$layout/Assets" | Out-Null
+          Copy-Item dist/win/banana-rs.exe $layout
+          Copy-Item -Recurse -Force dist/win/models "$layout/models"
+          Copy-Item assets/msix/*.png "$layout/Assets/"
+          (Get-Content scripts/msix/AppxManifest.xml -Raw).Replace('$NAME$', $env:MSIX_NAME).Replace('$PUBLISHER$', $env:MSIX_PUBLISHER).Replace('$PUBLISHER_DISPLAY$', $env:MSIX_PUBLISHER_DISPLAY).Replace('$VERSION$', "$version.0") | Set-Content "$layout/AppxManifest.xml"
+          $bin = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" | Sort-Object FullName -Descending | Select-Object -First 1).DirectoryName
+          & "$bin\makeappx.exe" pack /o /d $layout /p "dist/BananaPhotos-$version-x64.msix"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # A copy signed with a throwaway certificate, installed here to check the package.
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $env:MSIX_PUBLISHER -KeyUsage DigitalSignature -CertStoreLocation "Cert:\CurrentUser\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          Copy-Item "dist/BananaPhotos-$version-x64.msix" "dist/msix-test.msix"
+          & "$bin\signtool.exe" sign /fd SHA256 /sha1 $cert.Thumbprint "dist/msix-test.msix"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Export-Certificate -Cert $cert -FilePath dist/msix-test.cer | Out-Null
+          Import-Certificate -FilePath dist/msix-test.cer -CertStoreLocation "Cert:\LocalMachine\TrustedPeople" | Out-Null
+          Add-AppxPackage -Path "dist/msix-test.msix"
+          $installed = Get-AppxPackage -Name $env:MSIX_NAME
+          if (-not $installed) { Write-Error "the package didn't install"; exit 1 }
+          Write-Host "Installed $($installed.PackageFullName) at $($installed.InstallLocation)"
+          Get-ChildItem $installed.InstallLocation | Format-Table Name, Length
+          Remove-AppxPackage $installed.PackageFullName
       - uses: actions/upload-artifact@v4
         with:
           name: banana-photos-windows-x64
           path: |
             dist/*-windows-x64.zip
             dist/*-x64-setup.exe
+            dist/*-x64.msix
