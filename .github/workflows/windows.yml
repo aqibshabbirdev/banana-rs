@@ -1,0 +1,24 @@
+# Builds and tests Banana Photos on Windows (x64), and keeps the result as an artifact.
+name: Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [production]
+    paths: ["src/**", "Cargo.*", "assets/**", ".github/workflows/windows.yml", "scripts/*windows*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --no-default-features
+      - name: Test
+        run: cargo test --release --no-default-features
+      - uses: actions/upload-artifact@v4
+        with:
+          name: banana-rs-windows-x64
+          path: target/release/banana-rs.exe
