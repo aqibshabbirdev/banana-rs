@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use image::{DynamicImage, RgbaImage};
-use windows::core::{HSTRING, PROPVARIANT};
+use windows::core::HSTRING;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
@@ -59,14 +59,14 @@ unsafe fn frame(path: &Path) -> windows::core::Result<Option<RgbaImage>> {
     let size = current.GetUINT64(&MF_MT_FRAME_SIZE)?;
     let (w, h) = ((size >> 32) as u32, (size & 0xffff_ffff) as u32);
     let stride = current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(w as i32 * 4);
-    // A second in (in 100 ns units) skips black first frames; a shorter video just starts.
-    let _ = reader.SetCurrentPosition(&windows::core::GUID::zeroed(), &PROPVARIANT::from(10_000_000i64));
-
-    for _ in 0..30 {
-        let (mut flags, mut sample) = (0u32, None::<IMFSample>);
-        reader.ReadSample(video, 0, None, Some(&mut flags), None, Some(&mut sample))?;
+    // The first frame about a second in (in 100 ns units), which skips black first frames; a
+    // shorter video gives its last one.
+    let mut last = None;
+    for _ in 0..45 {
+        let (mut flags, mut at, mut sample) = (0u32, 0i64, None::<IMFSample>);
+        reader.ReadSample(video, 0, None, Some(&mut flags), Some(&mut at), Some(&mut sample))?;
         if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-            return Ok(None);
+            break;
         }
         let Some(sample) = sample else { continue };
         let buffer = sample.ConvertToContiguousBuffer()?;
@@ -85,7 +85,10 @@ unsafe fn frame(path: &Path) -> windows::core::Result<Option<RgbaImage>> {
             }
         }
         buffer.Unlock()?;
-        return Ok(Some(img));
+        last = Some(img);
+        if at >= 10_000_000 {
+            break;
+        }
     }
-    Ok(None)
+    Ok(last)
 }
