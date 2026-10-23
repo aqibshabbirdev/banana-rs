@@ -35,6 +35,9 @@ class _ViewerState extends State<Viewer> {
   late int _index = widget.index;
   bool _chrome = true;
 
+  /// The photo on screen is zoomed in.
+  bool _zoomed = false;
+
   Item get _item => widget.items[_index];
 
   /// Saving or sharing: what (for the progress bar), and how far the download got (0–1, or null
@@ -156,12 +159,19 @@ class _ViewerState extends State<Viewer> {
       body: PageView.builder(
         controller: _pages,
         itemCount: widget.items.length,
-        onPageChanged: (i) => setState(() => _index = i),
+        // A zoomed-in photo is panned by dragging, not swiped away.
+        physics: _zoomed ? const NeverScrollableScrollPhysics() : null,
+        onPageChanged: (i) => setState(() {
+          _index = i;
+          _zoomed = false;
+        }),
         itemBuilder: (context, i) {
           final it = widget.items[i];
           return GestureDetector(
             onTap: () => setState(() => _chrome = !_chrome),
-            child: it.video ? VideoPage(item: it, api: widget.api, cache: widget.cache, active: i == _index) : PhotoPage(item: it, api: widget.api, cache: widget.cache),
+            child: it.video
+                ? VideoPage(item: it, api: widget.api, cache: widget.cache, active: i == _index)
+                : PhotoPage(item: it, api: widget.api, cache: widget.cache, onZoomed: (z) => z != _zoomed ? setState(() => _zoomed = z) : null),
           );
         },
       ),
@@ -169,14 +179,18 @@ class _ViewerState extends State<Viewer> {
   }
 }
 
-/// The photo at screen size, zoomable. The thumbnail shows, with a spinner, while it loads and
-/// while the computer can't be reached; then it tries again by itself every few seconds.
+/// The photo at screen size: pinch or double-tap to zoom. The thumbnail shows, with a spinner,
+/// while it loads and while the computer can't be reached; then it tries again by itself every
+/// few seconds.
 class PhotoPage extends StatefulWidget {
-  const PhotoPage({super.key, required this.item, required this.api, required this.cache});
+  const PhotoPage({super.key, required this.item, required this.api, required this.cache, this.onZoomed});
 
   final Item item;
   final Api api;
   final CacheManager cache;
+
+  /// Called with whether the photo is zoomed in, when that changes.
+  final void Function(bool zoomed)? onZoomed;
 
   @override
   State<PhotoPage> createState() => _PhotoPageState();
@@ -185,14 +199,37 @@ class PhotoPage extends StatefulWidget {
 /// How long to wait before asking the computer again for something that didn't load.
 const retryAfter = Duration(seconds: 4);
 
-class _PhotoPageState extends State<PhotoPage> {
+class _PhotoPageState extends State<PhotoPage> with SingleTickerProviderStateMixin {
   int _attempt = 0;
   Timer? _retry;
+
+  final _zoom = TransformationController();
+  late final AnimationController _anim = AnimationController(vsync: this, duration: const Duration(milliseconds: 220))
+    ..addListener(() => _zoom.value = _tween!.evaluate(CurvedAnimation(parent: _anim, curve: Curves.easeOut)));
+  Matrix4Tween? _tween;
+  Offset _tapAt = Offset.zero;
 
   @override
   void dispose() {
     _retry?.cancel();
+    _anim.dispose();
+    _zoom.dispose();
     super.dispose();
+  }
+
+  bool get _zoomedIn => _zoom.value.getMaxScaleOnAxis() > 1.01;
+
+  /// Double-tap: zoom in on where the finger was, or back out.
+  void _doubleTap() {
+    final zoomIn = !_zoomedIn;
+    final end = zoomIn
+        ? (Matrix4.identity()
+          ..translateByDouble(-_tapAt.dx * 1.5, -_tapAt.dy * 1.5, 0, 1)
+          ..scaleByDouble(2.5, 2.5, 1, 1))
+        : Matrix4.identity();
+    _tween = Matrix4Tween(begin: _zoom.value, end: end);
+    _anim.forward(from: 0);
+    widget.onZoomed?.call(zoomIn);
   }
 
   void _retryLater(String url, String key) {
@@ -213,22 +250,29 @@ class _PhotoPageState extends State<PhotoPage> {
     final px = (MediaQuery.sizeOf(context).longestSide * MediaQuery.devicePixelRatioOf(context)).round().clamp(1024, 4096);
     final url = api.photoUrl(item.id, max: px), key = 'p$px-${item.id}';
     Widget waiting() => ThumbWithSpinner(item: item, api: api, cache: widget.cache);
-    return InteractiveViewer(
-      maxScale: 6,
-      child: Center(
-        child: CachedNetworkImage(
-          key: ValueKey('$key#$_attempt'),
-          imageUrl: url,
-          cacheKey: key,
-          httpHeaders: api.headers,
-          cacheManager: widget.cache,
-          fit: BoxFit.contain,
-          fadeInDuration: Duration.zero,
-          placeholder: (_, _) => waiting(),
-          errorWidget: (_, _, _) {
-            _retryLater(url, key);
-            return waiting();
-          },
+    return GestureDetector(
+      onDoubleTapDown: (d) => _tapAt = d.localPosition,
+      onDoubleTap: _doubleTap,
+      child: InteractiveViewer(
+        transformationController: _zoom,
+        maxScale: 6,
+        onInteractionStart: (_) => _anim.stop(),
+        onInteractionEnd: (_) => widget.onZoomed?.call(_zoomedIn),
+        child: Center(
+          child: CachedNetworkImage(
+            key: ValueKey('$key#$_attempt'),
+            imageUrl: url,
+            cacheKey: key,
+            httpHeaders: api.headers,
+            cacheManager: widget.cache,
+            fit: BoxFit.contain,
+            fadeInDuration: Duration.zero,
+            placeholder: (_, _) => waiting(),
+            errorWidget: (_, _, _) {
+              _retryLater(url, key);
+              return waiting();
+            },
+          ),
         ),
       ),
     );
