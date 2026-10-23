@@ -624,7 +624,7 @@ pub fn lan_addresses() -> Vec<Ipv4Addr> {
 }
 
 /// "Aqib's MacBook Pro", or the host name.
-fn computer_name() -> String {
+pub fn computer_name() -> String {
     #[cfg(target_os = "macos")]
     if let Ok(out) = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output() {
         let name = String::from_utf8_lossy(&out.stdout).trim().to_string();

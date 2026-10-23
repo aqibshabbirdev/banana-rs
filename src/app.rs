@@ -18,6 +18,7 @@ use crate::remote;
 use crate::library::{is_screenshot, spawn_scan, Photo, ScanMsg};
 use crate::people::{self, DocKind, FaceRef, Person, Pet};
 use crate::store::Store;
+use crate::sync;
 use crate::thumbs::{cache_key, spawn_full, Job, Loaded, ThumbLoader};
 use crate::transfer;
 use crate::vault;
@@ -26,6 +27,8 @@ use crate::video;
 const MAX_TEXTURES: usize = 3000;
 #[cfg(target_os = "macos")]
 const IC_POLL: f64 = 0.5;
+/// Seconds between syncs with the paired computers (and on "Sync now").
+const SYNC_EVERY: f64 = 120.0;
 
 #[cfg(target_os = "macos")]
 const KEEPS_RUNNING: &str =
@@ -450,6 +453,19 @@ pub struct PhotosApp {
     /// macOS: the 🍌 in the menu bar while phones can connect.
     #[cfg(target_os = "macos")]
     menubar: Option<crate::menubar::MenuBar>,
+
+    // Other computers this one syncs with (sync.rs): the list, the ones syncing now with what
+    // they're doing, when to sync next, and adding one (computers found, and pairing).
+    computers: Vec<sync::Computer>,
+    sync_tx: Sender<sync::Msg>,
+    sync_rx: Receiver<sync::Msg>,
+    syncing: HashMap<String, String>,
+    sync_next: f64,
+    finding: Option<Receiver<Vec<sync::Found>>>,
+    found: Option<Vec<sync::Found>>,
+    /// The computer being paired, the six digits typed, and how pairing went.
+    pairing: Option<(sync::Found, String, Option<String>)>,
+    pairing_rx: Option<Receiver<Result<sync::Computer, String>>>,
     /// Closing the window really quits (Quit was chosen), instead of minimising it.
     quitting: bool,
 
@@ -490,6 +506,7 @@ impl PhotosApp {
         let (scan_tx, scan_rx) = channel();
         let (full_tx, full_rx) = channel();
         let (analysis_tx, analysis_rx) = channel();
+        let (sync_tx, sync_rx) = channel();
         let mut app = Self {
             root: None,
             gen: 0,
@@ -574,6 +591,16 @@ impl PhotosApp {
             remote_rescan_at: None,
             #[cfg(target_os = "macos")]
             menubar: None,
+            computers: sync::load_computers(),
+            sync_tx,
+            sync_rx,
+            syncing: HashMap::new(),
+            // A few seconds after start, once the folder has been read.
+            sync_next: 8.0,
+            finding: None,
+            found: None,
+            pairing: None,
+            pairing_rx: None,
             quitting: false,
             transfer: TransferForm::default(),
             transfer_job: None,
@@ -723,7 +750,9 @@ impl PhotosApp {
         self.poll_queries();
         self.poll_duplicates(ctx);
         self.poll_devices(now);
-        self.poll_remote(ctx, now);
+        self.poll_remote(now);
+        self.poll_sync(ctx, now);
+        self.poll_rescan(ctx, now);
         if self.view_dirty {
             self.apply_view(ctx);
         }
@@ -1250,7 +1279,7 @@ impl PhotosApp {
             (icon::ARCHIVE, "Archive", Page::Archive),
             (icon::LOCK_SIMPLE, "Locked Folder", Page::Locked),
             (icon::ARROWS_DOWN_UP, "Import & export", Page::Transfer),
-            (icon::QR_CODE, "Connect phone", Page::Connect),
+            (icon::QR_CODE, "Connect phone & computers", Page::Connect),
         ];
         for (ic, label, page) in items {
             let on = self.page == page || (page == Page::People && matches!(self.page, Page::Person(_) | Page::Pets(_)));
@@ -3330,7 +3359,7 @@ impl PhotosApp {
     }
 
     /// Keeps the phones' view of the library current, and acts on what they did.
-    fn poll_remote(&mut self, ctx: &egui::Context, now: f64) {
+    fn poll_remote(&mut self, now: f64) {
         let Some(r) = &self.remote else { return };
         let mut favorites_changed = false;
         let events: Vec<remote::Event> = r.events.try_iter().collect();
@@ -3371,17 +3400,6 @@ impl PhotosApp {
         if favorites_changed {
             self.view_dirty = true;
         }
-        if let Some(t) = self.remote_rescan_at {
-            if now >= t && !self.scanning && self.transfer_job.is_none() {
-                self.remote_rescan_at = None;
-                if let Some(root) = self.root.clone() {
-                    self.open_folder(root, ctx);
-                }
-            } else {
-                // Nothing else may wake the app (nobody at the computer), so ask to be woken.
-                ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.5)));
-            }
-        }
         // Send the library again when it changed (cheap check; at most once a second while scanning).
         let stamp = (self.gen, self.photos.len(), self.store.favorites.len(), self.store.archived.len(), self.albums_people_stamp());
         if self.remote_sent != Some(stamp) && (!self.scanning || self.photos.is_empty()) {
@@ -3405,9 +3423,286 @@ impl PhotosApp {
         h.finish()
     }
 
+    /// Re-scans the folder once files stop arriving (from phones, or a computer syncing).
+    fn poll_rescan(&mut self, ctx: &egui::Context, now: f64) {
+        if let Some(t) = self.remote_rescan_at {
+            if now >= t && !self.scanning && self.transfer_job.is_none() {
+                self.remote_rescan_at = None;
+                if let Some(root) = self.root.clone() {
+                    self.open_folder(root, ctx);
+                }
+            } else {
+                // Nothing else may wake the app (nobody at the computer), so ask to be woken.
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64((t - now).max(0.5)));
+            }
+        }
+    }
+
+    /// Syncs with the paired computers every couple of minutes (and on "Sync now"), and takes
+    /// in what syncing brought: new files (re-scan) and favourites, albums and names.
+    fn poll_sync(&mut self, ctx: &egui::Context, now: f64) {
+        let msgs: Vec<sync::Msg> = self.sync_rx.try_iter().collect();
+        for m in msgs {
+            match m {
+                sync::Msg::Progress { fingerprint, text } => {
+                    self.syncing.insert(fingerprint, text);
+                }
+                sync::Msg::Done { computer, result } => {
+                    self.syncing.remove(&computer.fingerprint);
+                    if let Some(c) = self.computers.iter_mut().find(|c| c.fingerprint == computer.fingerprint) {
+                        // The direction may have been changed while it ran: keep that.
+                        let direction = c.direction;
+                        *c = sync::Computer { direction, ..*computer };
+                        sync::save_computers(&self.computers);
+                    }
+                    if let Ok(out) = result {
+                        if out.received > 0 {
+                            self.remote_rescan_at = Some(now + 1.0);
+                        }
+                        if let (Some(meta), Some(root)) = (out.meta, self.root.clone()) {
+                            meta.apply_to(&root, &mut self.store);
+                            self.view_dirty = true;
+                            self.people_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(rx) = &self.finding {
+            if let Ok(list) = rx.try_recv() {
+                self.found = Some(list);
+                self.finding = None;
+            }
+        }
+        if let Some(rx) = &self.pairing_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.pairing_rx = None;
+                match result {
+                    Ok(c) => {
+                        self.computers.retain(|o| o.fingerprint != c.fingerprint);
+                        self.computers.push(c);
+                        sync::save_computers(&self.computers);
+                        self.pairing = None;
+                        self.found = None;
+                        self.sync_next = now;
+                    }
+                    Err(e) => {
+                        if let Some(p) = &mut self.pairing {
+                            p.2 = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+        if self.computers.is_empty() {
+            return;
+        }
+        if now >= self.sync_next {
+            self.sync_next = now + SYNC_EVERY;
+            self.sync_all(ctx);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((self.sync_next - now).max(1.0)));
+        }
+    }
+
+    /// Starts a sync with every paired computer that isn't syncing already.
+    fn sync_all(&mut self, ctx: &egui::Context) {
+        let (Some(root), Some(data)) = (self.root.clone(), crate::store::data_dir()) else { return };
+        // Not while the folder is still being read: it would look like files are missing.
+        if self.scanning {
+            return;
+        }
+        for c in self.computers.clone() {
+            if self.syncing.contains_key(&c.fingerprint) {
+                continue;
+            }
+            let local = sync::Local {
+                files: self.photos.iter().filter_map(|p| Some((sync::rel(&root, &p.path)?, p.size))).collect(),
+                meta: sync::Meta::from_store(&root, &self.store),
+                root: root.clone(),
+                data: data.clone(),
+            };
+            self.syncing.insert(c.fingerprint.clone(), format!("Syncing with {}…", c.name));
+            sync::spawn(c, local, self.sync_tx.clone(), ctx.clone());
+        }
+    }
+
+    /// Connect → Computers: pairing another computer, and the ones this one syncs with.
+    fn computers_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(22.0);
+        ui.label(egui::RichText::new("Computers").size(18.0).color(TEXT));
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Keep another computer's Banana Photos in step with this one, over your own network: both ways, or one keeps a copy of the other. \
+                     Photos go to the same folders inside each library. Favourites, albums, archive and names go along; deleting a photo doesn't.",
+                )
+                .color(TEXT_DIM),
+            )
+            .wrap(),
+        );
+        ui.add_space(8.0);
+        if let Some(r) = &self.remote {
+            if let Some(pin) = r.pairing_pin() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "To add this computer on another one: there, open Connect › Computers › Add computer, choose “{}” and enter  {} {}",
+                        r.shared.name,
+                        &pin[..3],
+                        &pin[3..]
+                    ))
+                    .color(TEXT),
+                );
+            }
+            let theirs: Vec<remote::Phone> = r.phones().into_iter().filter(|p| p.computer).collect();
+            let mut forget = None;
+            for p in &theirs {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{}  {} syncs with this computer", icon::DESKTOP, p.name)).color(TEXT_DIM));
+                    if ui.add(egui::Button::new(egui::RichText::new("Remove").color(HEART)).frame(false)).clicked() {
+                        forget = Some(p.key().to_string());
+                    }
+                });
+            }
+            if let Some(k) = forget {
+                r.forget_phone(&k);
+            }
+        } else {
+            ui.label(egui::RichText::new("Turn on the switch above so other computers can add this one.").color(TEXT_DIM).size(12.5));
+        }
+
+        ui.add_space(10.0);
+        let mut sync_now = None;
+        let mut remove = None;
+        let mut changed = false;
+        let now = chrono::Utc::now().timestamp();
+        for c in &mut self.computers {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{}  {}", icon::DESKTOP, c.name)).size(15.0).color(TEXT));
+                let label = |d: sync::Direction| match d {
+                    sync::Direction::Both => "Both ways".to_string(),
+                    sync::Direction::Send => "Send from this computer".to_string(),
+                    sync::Direction::Get => "Get from it".to_string(),
+                };
+                egui::ComboBox::from_id_salt(("direction", &c.fingerprint)).selected_text(label(c.direction)).show_ui(ui, |ui| {
+                    for d in [sync::Direction::Both, sync::Direction::Send, sync::Direction::Get] {
+                        changed |= ui.selectable_value(&mut c.direction, d, label(d)).changed();
+                    }
+                });
+                let busy = self.syncing.get(&c.fingerprint);
+                if busy.is_none() && ui.add(egui::Button::new(egui::RichText::new(format!("{}  Sync now", icon::ARROWS_CLOCKWISE)).color(ACCENT)).frame(false)).clicked() {
+                    sync_now = Some(());
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("Remove").color(HEART)).frame(false)).on_hover_text("Stop syncing with it (nothing is deleted)").clicked() {
+                    remove = Some(c.fingerprint.clone());
+                }
+            });
+            let status = match (self.syncing.get(&c.fingerprint), c.last_sync) {
+                (Some(text), _) => text.clone(),
+                (None, Some(t)) => {
+                    let mins = (now - t).max(0) / 60;
+                    let when = if mins < 1 { "just now".to_string() } else if mins < 60 { format!("{mins} min ago") } else { format!("{} h ago", mins / 60) };
+                    format!("Synced {when} · {}", c.last_note)
+                }
+                (None, None) if !c.last_note.is_empty() => c.last_note.clone(),
+                (None, None) => "Not synced yet".to_string(),
+            };
+            ui.label(egui::RichText::new(status).color(TEXT_DIM).size(12.5));
+            ui.add_space(4.0);
+        }
+        if changed {
+            sync::save_computers(&self.computers);
+        }
+        if sync_now.is_some() {
+            self.sync_all(ctx);
+        }
+        if let Some(fp) = remove {
+            self.computers.retain(|c| c.fingerprint != fp);
+            sync::forget(&fp);
+        }
+
+        // Adding one: the computers seen on the network, then the six digits it shows.
+        ui.add_space(6.0);
+        if self.finding.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new("Looking for computers on this network…").color(TEXT_DIM));
+            });
+        } else if self.found.is_none()
+            && self.pairing.is_none()
+            && ui.add(egui::Button::new(egui::RichText::new(format!("{}  Add computer", icon::PLUS)).color(ACCENT)).frame(false)).clicked()
+        {
+            let own = self.remote.as_ref().map(|r| r.shared.fingerprint.clone()).unwrap_or_default();
+            let (tx, rx) = channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(sync::discover(&own, std::time::Duration::from_secs(3)));
+                ctx.request_repaint();
+            });
+            self.finding = Some(rx);
+        }
+        if let Some(found) = self.found.clone() {
+            if found.is_empty() {
+                ui.label(
+                    egui::RichText::new("No other computer found. Open Banana Photos there, turn on Connect, and keep both on the same network.").color(TEXT_DIM),
+                );
+            }
+            for f in &found {
+                if self.computers.iter().any(|c| c.fingerprint == f.fingerprint) {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{}  {}", icon::DESKTOP, f.name)).color(TEXT));
+                    if ui.add(egui::Button::new(egui::RichText::new("Choose").color(ACCENT)).frame(false)).clicked() {
+                        self.pairing = Some((f.clone(), String::new(), None));
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("Look again").color(ACCENT)).frame(false)).clicked() {
+                    self.found = None;
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("Cancel").color(TEXT_DIM)).frame(false)).clicked() {
+                    self.found = None;
+                    self.pairing = None;
+                }
+            });
+        }
+        let mut start_pairing = None;
+        if let Some((f, pin, error)) = &mut self.pairing {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(format!("Enter the six digits shown under Connect › Computers on {}:", f.name)).color(TEXT));
+            ui.horizontal(|ui| {
+                let field = ui.add(egui::TextEdit::singleline(pin).desired_width(120.0).hint_text("123 456"));
+                let go = ui.add_enabled(self.pairing_rx.is_none(), egui::Button::new("Pair"));
+                if go.clicked() || (field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+                    start_pairing = Some((f.clone(), pin.clone()));
+                }
+                if self.pairing_rx.is_some() {
+                    ui.spinner();
+                }
+            });
+            if let Some(e) = error {
+                ui.label(egui::RichText::new(e.as_str()).color(HEART));
+            }
+        }
+        if let Some((f, pin)) = start_pairing {
+            if let Some(p) = &mut self.pairing {
+                p.2 = None;
+            }
+            let (tx, rx) = channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(sync::pair(&f, &pin, &remote::computer_name()));
+                ctx.request_repaint();
+            });
+            self.pairing_rx = Some(rx);
+        }
+    }
+
     fn connect_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.label(egui::RichText::new("Connect phone").size(30.0).color(TEXT));
+        ui.label(egui::RichText::new("Connect phone & computers").size(30.0).color(TEXT));
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.set_max_width(820.0);
             ui.add(
@@ -3421,7 +3716,7 @@ impl PhotosApp {
             );
             ui.add_space(10.0);
             let mut on = self.remote.is_some();
-            if ui.checkbox(&mut on, "Let phones on this network connect").changed() {
+            if ui.checkbox(&mut on, "Let phones and other computers on this network connect").changed() {
                 self.set_phones_enabled(on, &ctx);
             }
             if let Some(e) = &self.remote_error {
@@ -3436,75 +3731,84 @@ impl PhotosApp {
                     }
                 });
             }
-            let Some(r) = &self.remote else { return };
-
-            ui.add_space(14.0);
-            if self.remote_qr.is_none() {
-                let code = r.new_pairing_code();
-                let payload = r.qr_payload(&code);
-                #[cfg(debug_assertions)]
-                if std::env::var_os("BANANA_PHONES").is_some() {
-                    eprintln!("pairing link: {payload}");
-                }
-                if let Some(img) = qr_image(&payload) {
-                    self.remote_qr = Some((payload, ctx.load_texture("pairing-qr", img, TextureOptions::NEAREST)));
-                }
+            if self.remote.is_some() {
+                self.phones_section(ui, &ctx);
             }
-            let addresses: Vec<String> = remote::lan_addresses().iter().map(|a| a.to_string()).collect();
-            ui.horizontal(|ui| {
-                if let Some((_, tex)) = &self.remote_qr {
-                    ui.add(egui::Image::from_texture(tex).fit_to_exact_size(vec2(260.0, 260.0)));
-                }
-                ui.add_space(18.0);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new("Scan with the Banana Photos app").size(18.0).color(TEXT));
-                    ui.add_space(6.0);
-                    for line in [
-                        "1. Put the phone on the same Wi-Fi as this computer.",
-                        "2. Open Banana Photos on the phone and tap Connect to computer.",
-                        "3. Point it at this code.",
-                    ] {
-                        ui.label(egui::RichText::new(line).color(TEXT_DIM));
-                    }
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("The code works once, for 10 minutes.").color(TEXT_DIM).size(12.5));
-                    if ui.add(egui::Button::new(egui::RichText::new(format!("{}  New code", icon::ARROWS_CLOCKWISE)).color(ACCENT)).frame(false)).clicked() {
-                        self.remote_qr = None;
-                    }
-                    ui.add_space(8.0);
-                    let at = if addresses.is_empty() { "no network found".to_string() } else { addresses.join(", ") };
-                    ui.label(egui::RichText::new(format!("{} · {at} · port {}", r.shared.name, remote::PORT)).color(TEXT_DIM).size(12.5));
-                    if cfg!(target_os = "linux") {
-                        ui.label(
-                            egui::RichText::new(format!("Phone can't connect? Allow the ports in the firewall: sudo ufw allow {}:{}/tcp", remote::PORT, remote::MEDIA_PORT))
-                                .color(TEXT_DIM)
-                                .size(12.5),
-                        );
-                    }
-                });
-            });
-
-            ui.add_space(18.0);
-            ui.label(egui::RichText::new("Connected phones").size(18.0).color(TEXT));
-            let phones = r.phones();
-            if phones.is_empty() {
-                ui.label(egui::RichText::new("None yet.").color(TEXT_DIM));
-            }
-            let mut forget = None;
-            for p in &phones {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{}  {}", icon::DEVICE_MOBILE, p.name)).color(TEXT));
-                    let seen = chrono::DateTime::from_timestamp(p.last_seen, 0).map(|t| t.with_timezone(&Local).format("%b %-d, %H:%M").to_string()).unwrap_or_default();
-                    ui.label(egui::RichText::new(format!("last seen {seen}")).color(TEXT_DIM).size(12.5));
-                    if ui.add(egui::Button::new(egui::RichText::new("Remove").color(HEART)).frame(false)).on_hover_text("It stops working at once; scan again to reconnect").clicked() {
-                        forget = Some(p.key().to_string());
-                    }
-                });
-            }
-            if let Some(k) = forget {
-                r.forget_phone(&k);
-            }
+            self.computers_section(ui, &ctx);
         });
+    }
+
+    /// Connect → the QR code for phones, and the phones connected.
+    fn phones_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(r) = &self.remote else { return };
+
+        ui.add_space(14.0);
+        if self.remote_qr.is_none() {
+            let code = r.new_pairing_code();
+            let payload = r.qr_payload(&code);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("BANANA_PHONES").is_some() {
+                eprintln!("pairing link: {payload}");
+                eprintln!("computer code: {}", r.pairing_pin().unwrap_or_default());
+            }
+            if let Some(img) = qr_image(&payload) {
+                self.remote_qr = Some((payload, ctx.load_texture("pairing-qr", img, TextureOptions::NEAREST)));
+            }
+        }
+        let addresses: Vec<String> = remote::lan_addresses().iter().map(|a| a.to_string()).collect();
+        ui.horizontal(|ui| {
+            if let Some((_, tex)) = &self.remote_qr {
+                ui.add(egui::Image::from_texture(tex).fit_to_exact_size(vec2(260.0, 260.0)));
+            }
+            ui.add_space(18.0);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Scan with the Banana Photos app").size(18.0).color(TEXT));
+                ui.add_space(6.0);
+                for line in [
+                    "1. Put the phone on the same Wi-Fi as this computer.",
+                    "2. Open Banana Photos on the phone and tap Connect to computer.",
+                    "3. Point it at this code.",
+                ] {
+                    ui.label(egui::RichText::new(line).color(TEXT_DIM));
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("The code works once, for 10 minutes.").color(TEXT_DIM).size(12.5));
+                if ui.add(egui::Button::new(egui::RichText::new(format!("{}  New code", icon::ARROWS_CLOCKWISE)).color(ACCENT)).frame(false)).clicked() {
+                    self.remote_qr = None;
+                }
+                ui.add_space(8.0);
+                let at = if addresses.is_empty() { "no network found".to_string() } else { addresses.join(", ") };
+                ui.label(egui::RichText::new(format!("{} · {at} · port {}", r.shared.name, remote::PORT)).color(TEXT_DIM).size(12.5));
+                if cfg!(target_os = "linux") {
+                    ui.label(
+                        egui::RichText::new(format!("Phone can't connect? Allow the ports in the firewall: sudo ufw allow {}:{}/tcp", remote::PORT, remote::MEDIA_PORT))
+                            .color(TEXT_DIM)
+                            .size(12.5),
+                    );
+                }
+            });
+        });
+
+        ui.add_space(18.0);
+        ui.label(egui::RichText::new("Connected phones").size(18.0).color(TEXT));
+        let phones: Vec<remote::Phone> = r.phones().into_iter().filter(|p| !p.computer).collect();
+        if phones.is_empty() {
+            ui.label(egui::RichText::new("None yet.").color(TEXT_DIM));
+        }
+        let mut forget = None;
+        for p in &phones {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{}  {}", icon::DEVICE_MOBILE, p.name)).color(TEXT));
+                let seen = chrono::DateTime::from_timestamp(p.last_seen, 0).map(|t| t.with_timezone(&Local).format("%b %-d, %H:%M").to_string()).unwrap_or_default();
+                ui.label(egui::RichText::new(format!("last seen {seen}")).color(TEXT_DIM).size(12.5));
+                if ui.add(egui::Button::new(egui::RichText::new("Remove").color(HEART)).frame(false)).on_hover_text("It stops working at once; scan again to reconnect").clicked() {
+                    forget = Some(p.key().to_string());
+                }
+            });
+        }
+        if let Some(k) = forget {
+            r.forget_phone(&k);
+        }
     }
 
     fn poll_devices(&mut self, now: f64) {

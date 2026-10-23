@@ -233,6 +233,15 @@ pub fn discover(own_fingerprint: &str, wait: Duration) -> Vec<Found> {
         }
     }
     let _ = daemon.shutdown();
+    // Testing (debug builds): BANANA_SYNC_FOUND="name,fingerprint,host,port" adds a computer
+    // mDNS can't see (in a container, say).
+    #[cfg(debug_assertions)]
+    if let Some(v) = std::env::var("BANANA_SYNC_FOUND").ok() {
+        let p: Vec<&str> = v.split(',').collect();
+        if let [name, fp, host, port] = p[..] {
+            found.push(Found { name: name.into(), fingerprint: fp.into(), hosts: vec![host.into()], port: port.parse().unwrap_or(0) });
+        }
+    }
     found
 }
 
@@ -283,7 +292,7 @@ pub struct Local {
 pub enum Msg {
     Progress { fingerprint: String, text: String },
     /// `computer` comes back with the address that worked and the result noted.
-    Done { computer: Computer, result: Result<Outcome, String> },
+    Done { computer: Box<Computer>, result: Result<Outcome, String> },
 }
 
 pub struct Outcome {
@@ -315,7 +324,7 @@ pub fn spawn(mut computer: Computer, local: Local, tx: Sender<Msg>, ctx: eframe:
             }
             Err(e) => computer.last_note = e.clone(),
         }
-        let _ = tx.send(Msg::Done { computer, result });
+        let _ = tx.send(Msg::Done { computer: Box::new(computer), result });
         ctx.request_repaint();
     });
 }
@@ -599,6 +608,24 @@ mod tests {
             _ => None,
         }).last();
         assert_eq!(pushed.map(|m| m.favorites), Some(set(&["c.jpg"])));
+
+        // One way: "Get" brings the other's new photo here but sends nothing back; "Send" the
+        // reverse.
+        std::fs::write(there_root.join("d.jpg"), jpeg(40)).unwrap();
+        std::fs::write(here_root.join("e.jpg"), jpeg(50)).unwrap();
+        let photos: Vec<_> = ["a.jpg", "2024/b.jpg", "c.jpg", "d.jpg"].iter().filter_map(|p| crate::library::read_photo(&there_root.join(p))).collect();
+        r.set_library(crate::remote::snapshot(Some(there_root.clone()), &photos, &store, &[], &crate::people::Index::default()));
+        let mut files_here = local(&["c.jpg"]);
+        files_here.files.push(("2024/b.jpg".into(), std::fs::metadata(here_root.join("2024/b.jpg")).unwrap().len()));
+        c.direction = Direction::Get;
+        let got = run(&mut c, &files_here, &|_| {}).unwrap();
+        assert_eq!((got.received, got.sent), (1, 0));
+        assert!(here_root.join("d.jpg").is_file() && !there_root.join("e.jpg").exists());
+        c.direction = Direction::Send;
+        files_here.files.push(("d.jpg".into(), std::fs::metadata(here_root.join("d.jpg")).unwrap().len()));
+        let sent = run(&mut c, &files_here, &|_| {}).unwrap();
+        assert_eq!((sent.received, sent.sent), (0, 1));
+        assert!(there_root.join("e.jpg").is_file());
 
         drop(r);
         let _ = std::fs::remove_dir_all(&base);
