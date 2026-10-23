@@ -8,20 +8,25 @@
 #   CLIP ViT-B/32 text encoder + tokenizer (same source)               - for search by description
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# SHA-256 of a file: shasum on macOS, sha256sum elsewhere (Git Bash on Windows has no shasum).
+sha256() {
+  if command -v shasum >/dev/null; then shasum -a 256 "$1"; else sha256sum "$1"; fi
+}
+
 DEST="${1:-assets/models}"
 mkdir -p "$DEST"
 
 fetch() {
   local name=$1 url=$2 sha=$3
   local out="$DEST/$name"
-  if [ -f "$out" ] && [ "$(shasum -a 256 "$out" | cut -d' ' -f1)" = "$sha" ]; then
+  if [ -f "$out" ] && [ "$(sha256 "$out" | cut -d' ' -f1)" = "$sha" ]; then
     echo "ok       $name"
     return
   fi
   echo "fetching $name"
   curl -sSfL -o "$out.part" "$url"
   local got
-  got=$(shasum -a 256 "$out.part" | cut -d' ' -f1)
+  got=$(sha256 "$out.part" | cut -d' ' -f1)
   if [ "$got" != "$sha" ]; then
     rm -f "$out.part"
     echo "checksum mismatch for $name (got $got)" >&2
