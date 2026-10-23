@@ -264,6 +264,29 @@ class Api {
     return j['status'] as String;
   }
 
+  /// Downloads a photo or video to [to]: the file as stored ([original]), or the photo as a
+  /// large JPEG.
+  Future<File> download(String id, File to, {bool original = true, void Function(int got, int total)? progress}) async {
+    final req = await _io.getUrl(uri('/api/photo/$id', original ? {'original': '1'} : {'max': '4096'}));
+    req.headers.set('Authorization', 'Bearer ${pairing.token}');
+    final resp = await req.close();
+    if (resp.statusCode != 200) {
+      final text = await resp.transform(utf8.decoder).join();
+      String? why;
+      try {
+        why = (jsonDecode(text) as Map<String, dynamic>)['error'] as String?;
+      } catch (_) {}
+      throw ApiException(resp.statusCode, why ?? 'Error ${resp.statusCode}');
+    }
+    var got = 0;
+    await resp.map((chunk) {
+      got += chunk.length;
+      progress?.call(got, resp.contentLength);
+      return chunk;
+    }).pipe(to.openWrite());
+    return to;
+  }
+
   void close() {
     client.close();
     _io.close(force: true);

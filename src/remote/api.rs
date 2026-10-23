@@ -256,7 +256,14 @@ fn has(lib: &Snapshot, phone: &str, req: &Request) -> Response {
     ) else {
         return Response::error(400, "needs name, size and taken");
     };
-    Response::json(200, &json!({ "have": crate::transfer::already_imported(&dir, name, taken, size) }))
+    let have = crate::transfer::already_imported(&dir, name, taken, size) || in_library(lib, name, size);
+    Response::json(200, &json!({ "have": have }))
+}
+
+/// A file of this name and size anywhere in the library: one the phone saved from here, which
+/// a backup shouldn't send back as a copy.
+fn in_library(lib: &Snapshot, name: &str, size: u64) -> bool {
+    lib.items.iter().any(|it| it.size == size && it.path.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name)))
 }
 
 /// A photo or video from the phone, as the raw file in the body (with Content-Length). It's
@@ -290,6 +297,11 @@ fn upload(shared: &Shared, lib: &Snapshot, phone: &str, req: &Request, body: &mu
             let _ = std::fs::remove_file(&tmp);
             return Response::error(400, "upload cut short");
         }
+    }
+    if in_library(lib, name, req.body_len) {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir(&tmp_dir);
+        return Response::json(200, &json!({ "status": "skipped" }));
     }
     let read = crate::library::read_photo(&tmp);
     let taken = read

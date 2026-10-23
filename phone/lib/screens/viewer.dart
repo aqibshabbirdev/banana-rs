@@ -1,4 +1,5 @@
-// One photo or video at a time: swipe between them, pinch to zoom, play videos, favourite.
+// One photo or video at a time: swipe between them, pinch to zoom, play videos, favourite,
+// save to this phone or share.
 
 import 'dart:async';
 import 'dart:io';
@@ -7,6 +8,9 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:photo_manager/photo_manager.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 
 import '../api.dart';
@@ -33,6 +37,78 @@ class _ViewerState extends State<Viewer> {
 
   Item get _item => widget.items[_index];
 
+  /// Saving or sharing: what (for the progress bar), and how far the download got (0–1, or null
+  /// while its size isn't known).
+  String? _busy;
+  double? _progress;
+
+  void _say(String text) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// The file from the computer in this phone's temporary folder (kept for an hour, so saving
+  /// and then sharing the same one fetches it once).
+  Future<File> _fetch(Item item, {required bool original}) async {
+    final dir = Directory('${(await getTemporaryDirectory()).path}/from-computer');
+    await dir.create(recursive: true);
+    final old = DateTime.now().subtract(const Duration(hours: 1));
+    for (final f in dir.listSync().whereType<File>()) {
+      if (f.statSync().modified.isBefore(old)) f.deleteSync();
+    }
+    final name = original ? item.name : '${item.name.replaceAll(RegExp(r'\.[^.]*$'), '')}.jpg';
+    final f = File('${dir.path}/${item.id}-$name');
+    if (f.existsSync() && f.lengthSync() > 0) return f;
+    final part = File('${f.path}.part');
+    await widget.api.download(item.id, part, original: original, progress: (got, total) {
+      if (mounted) setState(() => _progress = total > 0 ? got / total : null);
+    });
+    return part.rename(f.path);
+  }
+
+  Future<void> _run(String what, Future<void> Function(Item) job) async {
+    if (_busy != null) return;
+    setState(() {
+      _busy = what;
+      _progress = null;
+    });
+    try {
+      await job(_item);
+    } catch (e) {
+      _say("Couldn't get it from ${widget.api.pairing.name}: $e");
+    } finally {
+      if (mounted) setState(() => _busy = null);
+    }
+  }
+
+  /// Saves the original to this phone's gallery. The same file, so a backup skips it later.
+  Future<void> _save(Item item) async {
+    final p = await PhotoManager.requestPermissionExtend(requestOption: const PermissionRequestOption(iosAccessLevel: IosAccessLevel.addOnly));
+    if (!p.hasAccess) return _say('Allow Banana Photos to add to your photos (in Settings) to save it here.');
+    final f = await _fetch(item, original: true);
+    // Its date as a local time, so the gallery files it on the day it was taken.
+    final t = item.taken, taken = DateTime(t.year, t.month, t.day, t.hour, t.minute, t.second);
+    if (item.video) {
+      await PhotoManager.editor.saveVideo(f, title: item.name, creationDate: taken);
+    } else {
+      await PhotoManager.editor.saveImageWithPath(f.path, title: item.name, creationDate: taken);
+    }
+    _say(item.video ? 'Video saved to this phone.' : 'Photo saved to this phone.');
+  }
+
+  /// Not every app opens HEIC or RAW: those are shared as JPEG.
+  static final _convertForSharing = RegExp(r'\.(heic|heif|hif|avif|dng|cr2|cr3|nef|arw|raf|orf|rw2|tif|tiff)$', caseSensitive: false);
+
+  Future<void> _share(Item item) async {
+    final f = await _fetch(item, original: item.video || !_convertForSharing.hasMatch(item.name));
+    if (!mounted) return;
+    final box = context.findRenderObject() as RenderBox?;
+    await SharePlus.instance.share(ShareParams(
+      files: [XFile(f.path)],
+      // Where the share sheet points from on iPads.
+      sharePositionOrigin: box == null ? null : box.localToGlobal(Offset.zero) & box.size,
+    ));
+  }
+
   Future<void> _toggleFavorite() async {
     try {
       await widget.library.setFavorite(_item, !_item.favorite);
@@ -55,7 +131,20 @@ class _ViewerState extends State<Viewer> {
                 Text(DateFormat('EEE, MMM d, y').format(item.taken), style: const TextStyle(fontSize: 16)),
                 Text(DateFormat('HH:mm').format(item.taken), style: const TextStyle(fontSize: 12, color: Colors.white60)),
               ]),
+              bottom: _busy == null
+                  ? null
+                  : PreferredSize(preferredSize: const Size.fromHeight(2), child: LinearProgressIndicator(value: _progress, minHeight: 2)),
               actions: [
+                IconButton(
+                  tooltip: 'Share',
+                  onPressed: _busy == null ? () => _run('share', _share) : null,
+                  icon: const Icon(Icons.share_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Save to this phone',
+                  onPressed: _busy == null ? () => _run('save', _save) : null,
+                  icon: const Icon(Icons.download_outlined),
+                ),
                 IconButton(
                   tooltip: item.favorite ? 'Unfavorite' : 'Favorite',
                   onPressed: _toggleFavorite,

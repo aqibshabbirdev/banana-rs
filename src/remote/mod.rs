@@ -573,6 +573,12 @@ mod tests {
         let has: serde_json::Value = get(&format!("/api/has?name=IMG_0001.jpg&size={}&taken=1700000000", photo.len())).call().unwrap().into_json().unwrap();
         assert_eq!(has["have"], true);
         assert_eq!(status(upload("notes.txt").send_bytes(b"hi")), 415);
+        // A photo the phone saved from the library isn't sent back as a copy.
+        let beach_file = std::fs::read(root.join("beach.jpg")).unwrap();
+        let has: serde_json::Value = get(&format!("/api/has?name=BEACH.jpg&size={}&taken=1600000000", beach_file.len())).call().unwrap().into_json().unwrap();
+        assert_eq!(has["have"], true);
+        let back: serde_json::Value = upload("beach.jpg").send_bytes(&beach_file).unwrap().into_json().unwrap();
+        assert_eq!(back["status"], "skipped");
         let saved = crate::transfer::media_files(&root.join("Imported").join("Test phone"));
         assert_eq!(saved.len(), 1);
 

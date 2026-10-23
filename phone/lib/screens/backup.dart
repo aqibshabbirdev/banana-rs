@@ -4,6 +4,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:photo_manager/photo_manager.dart';
 
@@ -28,6 +29,18 @@ class _BackupPageState extends State<BackupPage> {
   void initState() {
     super.initState();
     _load(ask: false);
+    // Photos taken, saved or deleted while the app is open: count again.
+    PhotoManager.addChangeCallback(_changed);
+    PhotoManager.startChangeNotify();
+  }
+
+  void _changed(MethodCall _) => _load(ask: false);
+
+  @override
+  void dispose() {
+    PhotoManager.removeChangeCallback(_changed);
+    PhotoManager.stopChangeNotify();
+    super.dispose();
   }
 
   Future<void> _load({required bool ask}) async {

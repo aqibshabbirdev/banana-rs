@@ -18,6 +18,8 @@
 		<false/>
 		<key>NSCameraUsageDescription</key>
 		<string>To scan the code on your computer that connects this phone to Banana Photos.</string>
+		<key>NSPhotoLibraryAddUsageDescription</key>
+		<string>To save photos and videos from your computer to this phone.</string>
 		<key>NSPhotoLibraryUsageDescription</key>
 		<string>To back up your photos and videos to Banana Photos on your computer.</string>
 		<key>NSLocalNetworkUsageDescription</key>

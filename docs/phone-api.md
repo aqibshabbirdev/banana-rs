@@ -132,7 +132,7 @@ Open `url` in the player as is. It's plain HTTP on the media port, needs no head
 
 For each photo or video in the phone's gallery (`photo_manager`):
 
-1. `GET /api/has?name=<file name>&size=<bytes>&taken=<seconds>` → `{"have": true|false}`. Skip it when `true`.
+1. `GET /api/has?name=<file name>&size=<bytes>&taken=<seconds>` → `{"have": true|false}`. Skip it when `true`. It's also `true` for a file of that name and size anywhere in the library (one the phone saved from the computer), and such an upload is skipped.
 2. Otherwise `POST /api/upload?name=<file name>&taken=<seconds>` with the raw file as the body and `Content-Length` set (no chunked uploads):
 
    → `{"status": "imported", "name": "IMG_0001.jpg"}` or `{"status": "skipped"}` (already there).
