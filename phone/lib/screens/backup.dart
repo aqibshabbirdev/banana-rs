@@ -29,23 +29,31 @@ class _BackupPageState extends State<BackupPage> {
   void initState() {
     super.initState();
     _load(ask: false);
-    // Photos taken, saved or deleted while the app is open: count again.
-    PhotoManager.addChangeCallback(_changed);
-    PhotoManager.startChangeNotify();
   }
+
+  /// Watching the gallery, to count again when photos are taken, saved or deleted. Only once
+  /// access is granted: on iOS, watching asks for access, and the app shouldn't ask unprompted.
+  bool _watching = false;
 
   void _changed(MethodCall _) => _load(ask: false);
 
   @override
   void dispose() {
-    PhotoManager.removeChangeCallback(_changed);
-    PhotoManager.stopChangeNotify();
+    if (_watching) {
+      PhotoManager.removeChangeCallback(_changed);
+      PhotoManager.stopChangeNotify();
+    }
     super.dispose();
   }
 
   Future<void> _load({required bool ask}) async {
     final p = ask ? await PhotoManager.requestPermissionExtend() : await PhotoManager.getPermissionState(requestOption: const PermissionRequestOption());
     var count = 0;
+    if (p.hasAccess && !_watching) {
+      _watching = true;
+      PhotoManager.addChangeCallback(_changed);
+      PhotoManager.startChangeNotify();
+    }
     if (p.hasAccess) {
       final paths = await PhotoManager.getAssetPathList(onlyAll: true, type: RequestType.common);
       if (paths.isNotEmpty) count = await paths.first.assetCountAsync;

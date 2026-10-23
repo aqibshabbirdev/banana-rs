@@ -52,6 +52,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
     library.addListener(_onLibrary);
     library.loadSaved();
+    loadGridColumns();
     BackupSettings.load(widget.pairing.fingerprint).then((s) {
       if (!mounted) return;
       setState(() => _backup = Backup(api, s)..addListener(_onBackup));
