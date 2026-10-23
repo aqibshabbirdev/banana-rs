@@ -9,6 +9,7 @@ mod library;
 #[cfg(target_os = "macos")]
 mod menubar;
 mod people;
+mod places;
 mod remote;
 mod store;
 mod thumbs;

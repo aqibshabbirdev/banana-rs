@@ -78,6 +78,9 @@ enum Page {
     Archive,
     Albums,
     Album(usize),
+    /// Where photos were taken, by town (see places.rs); one town by its id.
+    Places,
+    Place(u32),
 }
 
 impl Page {
@@ -102,6 +105,8 @@ impl Page {
             Page::Doc(k) => 11 + k as usize,
             Page::Album(i) => 100 + 2 * i,
             Page::Person(i) => 101 + 2 * i,
+            Page::Places => 20,
+            Page::Place(id) => (1 << 32) + id as usize,
         }
     }
 }
@@ -350,6 +355,12 @@ pub struct PhotosApp {
     // People & pets
     people_index: people::Index,
     people: Vec<Person>,
+    /// The town each photo was taken in (by index into `photos`), and the towns with their
+    /// photos, most photos first; worked out again when the library changes (`places_for`).
+    place_of: Vec<Option<u32>>,
+    places: Vec<(u32, Vec<usize>)>,
+    place_names: HashMap<u32, String>,
+    places_for: (u64, usize),
     /// Extra lower-case words per photo for search: people's names, document kinds.
     photo_tags: HashMap<PathBuf, String>,
     /// Photos per document kind, newest first (filled when re-grouping).
@@ -496,6 +507,10 @@ impl PhotosApp {
             albums_open: true,
             people_index: people::Index::load(),
             people: Vec::new(),
+            place_of: Vec::new(),
+            places: Vec::new(),
+            place_names: HashMap::new(),
+            places_for: (u64::MAX, 0),
             photo_tags: HashMap::new(),
             doc_photos: HashMap::new(),
             docs_open: true,
@@ -747,8 +762,30 @@ impl PhotosApp {
         if self.page == Page::Recent { p.added } else { p.taken }
     }
 
+    /// Works out where each photo was taken, once per change of the library.
+    fn update_places(&mut self) {
+        if self.places_for == (self.gen, self.photos.len()) {
+            return;
+        }
+        self.places_for = (self.gen, self.photos.len());
+        self.place_of = self.photos.iter().map(|p| p.gps.and_then(|(lat, lon)| crate::places::nearest(lat, lon))).collect();
+        let mut by_place: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (id, place) in self.place_of.iter().enumerate() {
+            if let Some(place) = place {
+                by_place.entry(*place).or_default().push(id);
+            }
+        }
+        for ids in by_place.values_mut() {
+            ids.sort_by(|&a, &b| self.photos[b].taken.cmp(&self.photos[a].taken));
+        }
+        self.place_names = by_place.keys().map(|&id| (id, crate::places::name(id))).collect();
+        self.places = by_place.into_iter().collect();
+        self.places.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| self.place_names[&a.0].cmp(&self.place_names[&b.0])));
+    }
+
     fn apply_view(&mut self, ctx: &egui::Context) {
         self.view_dirty = false;
+        self.update_places();
         self.view_version += 1;
         // Keep the open photo open even though its position in `order` may move.
         let viewing = self.viewer.as_ref().and_then(|v| self.order.get(v.pos).copied());
@@ -767,7 +804,8 @@ impl PhotosApp {
                 Page::Videos => !archived && p.is_video,
                 Page::Screenshots => !archived && is_screenshot(&p.path),
                 Page::Archive => archived,
-                Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) | Page::Connect => false,
+                Page::Albums | Page::People | Page::Places | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) | Page::Connect => false,
+                Page::Place(place) => !archived && self.place_of.get(id).copied().flatten() == Some(place),
                 Page::Person(i) => self.people.get(i).is_some_and(|person| person.photos.contains(&p.path)),
                 Page::Pets(kind) => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.pet == Some(kind)),
                 Page::Documents => !archived && self.people_index.entries.get(&p.path).is_some_and(|a| a.doc.is_some()),
@@ -777,8 +815,11 @@ impl PhotosApp {
         };
         let mut order: Vec<usize> = (0..self.photos.len())
             .filter(|&id| {
-                on_page(id)
-                    && (terms.is_empty() || matches_search(&self.photos[id], &terms, self.photo_tags.get(&self.photos[id].path).map(String::as_str).unwrap_or("")))
+                on_page(id) && (terms.is_empty() || {
+                    let tags = self.photo_tags.get(&self.photos[id].path).map(String::as_str).unwrap_or("");
+                    let place = self.place_of.get(id).copied().flatten().and_then(|p| self.place_names.get(&p)).map(String::as_str).unwrap_or("");
+                    matches_search(&self.photos[id], &terms, tags, place)
+                })
             })
             .collect();
         order.sort_by(|&a, &b| self.when(b).cmp(&self.when(a)).then_with(|| self.photos[a].path.cmp(&self.photos[b].path)));
@@ -1195,6 +1236,7 @@ impl PhotosApp {
             (icon::STAR, "Favorites", Page::Favorites),
             (icon::PLAY_CIRCLE, "Videos", Page::Videos),
             (icon::USERS_THREE, "People & pets", Page::People),
+            (icon::MAP_PIN, "Places", Page::Places),
             (icon::DEVICE_MOBILE, "Screenshots & recordings", Page::Screenshots),
             (icon::COPY, "Duplicates", Page::Duplicates),
             (icon::CLOCK, "Recently added", Page::Recent),
@@ -1315,7 +1357,13 @@ impl PhotosApp {
             return;
         }
         let title = match self.page {
-            Page::Photos | Page::Albums | Page::People | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) | Page::Connect => return,
+            Page::Photos | Page::Albums | Page::People | Page::Places | Page::Locked | Page::Transfer | Page::Duplicates | Page::Device(_) | Page::Connect => return,
+            Page::Place(id) => {
+                let name = self.place_names.get(&id).cloned().unwrap_or_default();
+                ui.label(egui::RichText::new(name).size(30.0).color(TEXT));
+                ui.add_space(8.0);
+                return;
+            }
             Page::Person(i) => {
                 self.person_header(ui, i);
                 return;
@@ -1402,6 +1450,7 @@ impl PhotosApp {
                     Page::Documents | Page::Doc(_) if self.analysing => "Looking for documents… they appear here as photos are analysed.",
                     Page::Documents | Page::Doc(_) => "No documents found. Receipts, notes, menus, IDs and social media screenshots show up here.",
                     Page::Archive => "Nothing archived. Archive photos to hide them from Photos.",
+                    Page::Place(_) => "No photos.",
                     _ => "This album is empty. Go to Photos, select some, then add them to this album.",
                 }
             };
@@ -1699,6 +1748,79 @@ impl PhotosApp {
         self.set_wanted(wanted);
         if let Some(i) = open {
             self.set_page(Page::Album(i));
+        }
+    }
+
+    /// Places: a card per town photos were taken in (from their GPS), most photos first.
+    fn places_page(&mut self, ui: &mut egui::Ui) {
+        self.update_places();
+        ui.label(egui::RichText::new("Places").size(30.0).color(TEXT));
+        let located: usize = self.places.iter().map(|(_, ids)| ids.len()).sum();
+        ui.label(
+            egui::RichText::new(format!(
+                "{located} photos and videos with a location, in {} places · worked out on this computer · place names from GeoNames (CC BY 4.0)",
+                self.places.len()
+            ))
+            .color(TEXT_DIM),
+        );
+        ui.add_space(16.0);
+        if self.places.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("No photos with a location yet. Photos from phones with location turned on in the camera show up here, by town.").color(TEXT_DIM))
+            });
+            self.set_wanted(Vec::new());
+            return;
+        }
+        let mut open = None;
+        let mut wanted = Vec::new();
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(20.0, 20.0);
+                for (place, ids) in &self.places {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(CARD, CARD + 52.0), Sense::click());
+                    let cover_rect = Rect::from_min_size(rect.min, vec2(CARD, CARD));
+                    let cover = ids[0];
+                    match self.thumbs.get_mut(&cover) {
+                        Some((t, seen)) => {
+                            *seen = self.frame;
+                            egui::Image::from_texture(&*t)
+                                .uv(fill_uv(t.size_vec2(), cover_rect.size()))
+                                .corner_radius(CornerRadius::same(14))
+                                .paint_at(ui, cover_rect);
+                        }
+                        None => {
+                            if !self.failed.contains(&cover) {
+                                wanted.push(make_job(self.gen, cover, &self.photos[cover]));
+                            }
+                            ui.painter().rect_filled(cover_rect, CornerRadius::same(14), FIELD_BG);
+                            ui.painter().text(cover_rect.center(), Align2::CENTER_CENTER, icon::MAP_PIN, FontId::proportional(40.0), TEXT_DIM);
+                        }
+                    }
+                    if resp.hovered() {
+                        ui.painter().rect_stroke(cover_rect, CornerRadius::same(14), Stroke::new(2.0_f32, ACCENT), egui::StrokeKind::Inside);
+                    }
+                    // "Lahore" on the first line, "Pakistan · 120 items" under it.
+                    let name = self.place_names.get(place).map(String::as_str).unwrap_or("");
+                    let (town, country) = name.split_once(", ").unwrap_or((name, ""));
+                    let painter = ui.painter_at(rect);
+                    painter.text(pos2(rect.min.x + 2.0, cover_rect.max.y + 10.0), Align2::LEFT_TOP, town, FontId::proportional(16.0), TEXT);
+                    painter.text(
+                        pos2(rect.min.x + 2.0, cover_rect.max.y + 32.0),
+                        Align2::LEFT_TOP,
+                        format!("{country} · {} item{}", ids.len(), if ids.len() == 1 { "" } else { "s" }),
+                        FontId::proportional(13.0),
+                        TEXT_DIM,
+                    );
+                    if resp.clicked() {
+                        open = Some(*place);
+                    }
+                }
+            });
+        });
+        wanted.reverse();
+        self.set_wanted(wanted);
+        if let Some(place) = open {
+            self.set_page(Page::Place(place));
         }
     }
 
@@ -4094,6 +4216,8 @@ impl eframe::App for PhotosApp {
                         self.albums_page(ui);
                     } else if self.page == Page::People {
                         self.people_page(ui);
+                    } else if self.page == Page::Places {
+                        self.places_page(ui);
                     } else if self.page == Page::Transfer {
                         self.transfer_page(ui);
                     } else if self.page == Page::Locked {
@@ -4317,13 +4441,14 @@ fn draw_cell(
 }
 
 /// Every word must match the file name, a person's name, or some form of the date ("2024", "october", "oct", "sunday", "2024-10-06").
-fn matches_search(p: &Photo, terms: &[String], people: &str) -> bool {
+fn matches_search(p: &Photo, terms: &[String], people: &str, place: &str) -> bool {
     let name = p.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     let mut date = p.taken.format("%Y %B %b %A %a %-d %Y-%m-%d").to_string().to_lowercase();
     if p.is_video {
         date += " video videos";
     }
-    terms.iter().all(|t| name.contains(t.as_str()) || date.contains(t.as_str()) || people.contains(t.as_str()))
+    let place = place.to_lowercase();
+    terms.iter().all(|t| name.contains(t.as_str()) || date.contains(t.as_str()) || people.contains(t.as_str()) || place.contains(t.as_str()))
 }
 
 fn day_label(date: NaiveDate, today: NaiveDate) -> String {
@@ -4376,7 +4501,7 @@ fn save_last_folder(dir: &std::path::Path) {
 
 /// Dev-only hooks for screenshots without touching the mouse:
 /// `BANANA_SCREENSHOT=out.png` saves the window once the scan settles, then quits.
-/// `BANANA_PAGE=favorites|albums|album<N>|archive|recent|screenshots`, `BANANA_SELECT=0,1,2`,
+/// `BANANA_PAGE=favorites|albums|album<N>|archive|recent|screenshots|places|place`, `BANANA_SELECT=0,1,2`,
 /// `BANANA_SEARCH=text` and `BANANA_OPEN=<n>` set the scene first. `BANANA_VAULT_PASS` opens
 /// (or creates) Locked Folder, and `BANANA_VAULT_MOVE=0,1` moves those photos into it.
 #[cfg(debug_assertions)]
@@ -4425,6 +4550,13 @@ impl PhotosApp {
                 Some("cats") => self.set_page(Page::Pets(Pet::Cat)),
                 Some(p) if p.starts_with("person") => self.set_page(Page::Person(p[6..].parse().unwrap_or(0))),
                 Some("albums") => self.set_page(Page::Albums),
+                Some("places") => self.set_page(Page::Places),
+                Some("place") => {
+                    self.update_places();
+                    if let Some(&(place, _)) = self.places.first() {
+                        self.set_page(Page::Place(place));
+                    }
+                }
                 Some("archive") => self.set_page(Page::Archive),
                 Some("recent") => self.set_page(Page::Recent),
                 Some("screenshots") => self.set_page(Page::Screenshots),
