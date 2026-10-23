@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Margin, Rect, Sense, Shape, Stroke,
-    TextureHandle, TextureOptions,
+    self, pos2, vec2, Align2, Color32, CornerRadius, FontId, Key, Margin, Pos2, Rect, Sense, Shape, Stroke,
+    TextureHandle, TextureOptions, Vec2,
 };
 use egui_phosphor::regular as icon;
 
@@ -319,6 +319,13 @@ struct Viewer {
     /// Set when the open item is a video that the backend could start.
     player: Option<video::Player>,
     video_error: Option<String>,
+    /// How far the photo is zoomed in (1 = fitted to the window), and how far it's moved from
+    /// the middle, in points.
+    zoom: f32,
+    pan: Vec2,
+    /// The photo's size fitted to the view, and the view, as last drawn (for zooming).
+    fitted: Vec2,
+    area: Option<Rect>,
 }
 
 pub struct PhotosApp {
@@ -907,9 +914,9 @@ impl PhotosApp {
                 Ok(p) => (Some(p), None),
                 Err(e) => (None, Some(e)),
             };
-            self.viewer = Some(Viewer { pos, texture: None, failed: false, player, video_error });
+            self.viewer = Some(Viewer { pos, texture: None, failed: false, player, video_error, zoom: 1.0, pan: Vec2::ZERO, fitted: Vec2::ZERO, area: None });
         } else {
-            self.viewer = Some(Viewer { pos, texture: None, failed: false, player: None, video_error: None });
+            self.viewer = Some(Viewer { pos, texture: None, failed: false, player: None, video_error: None, zoom: 1.0, pan: Vec2::ZERO, fitted: Vec2::ZERO, area: None });
             spawn_full(path, self.gen, id, self.full_tx.clone(), ctx.clone());
         }
     }
@@ -1844,8 +1851,11 @@ impl PhotosApp {
             )
         });
 
+        let zoomed = v.zoom > 1.01;
         let mut go: Option<usize> = None;
-        let mut want_close = close && !typing;
+        // Esc zooms a zoomed-in photo back out first.
+        let mut want_close = close && !typing && !zoomed;
+        let zoom_out = close && !typing && zoomed;
         let mut toggle_fav = fav_key && !typing;
         let mut toggle_archive = false;
         let mut move_to_locked = false;
@@ -1892,11 +1902,17 @@ impl PhotosApp {
         });
         ui.add_space(6.0);
 
-        if !typing && prev && pos > 0 {
-            go = Some(pos - 1);
-        }
-        if !typing && next && pos + 1 < self.order.len() {
-            go = Some(pos + 1);
+        // While zoomed in, the arrow keys move around the photo instead of to the next one.
+        if !typing && zoomed && (prev || next) {
+            let v = self.viewer.as_mut().unwrap();
+            v.pan.x += if prev { 120.0 } else { -120.0 };
+        } else {
+            if !typing && prev && pos > 0 {
+                go = Some(pos - 1);
+            }
+            if !typing && next && pos + 1 < self.order.len() {
+                go = Some(pos + 1);
+            }
         }
 
         let area = ui.available_rect_before_wrap();
@@ -1904,26 +1920,44 @@ impl PhotosApp {
         if self.photos[id].is_video {
             self.video_frame(&ctx, typing);
         }
+        // A photo (not a video) can be zoomed: double-click, pinch or Ctrl/Cmd+scroll; then drag
+        // or scroll to move around it.
+        let is_photo = !self.photos[id].is_video;
+        if is_photo {
+            self.zoom_input(ui, area);
+        }
         let v = self.viewer.as_ref().unwrap();
+        let zoomed = v.zoom > 1.01;
         // Show the blurry thumbnail while the full image decodes.
         let tex = v.texture.as_ref().or_else(|| self.thumbs.get(&id).map(|(t, _)| t));
         if let Some(tex) = tex {
             let size = tex.size_vec2();
-            // Photos never upscale past 100%; video frames and placeholder thumbnails fill the view.
+            // Photos never upscale past 100% (until zoomed); video frames and placeholder
+            // thumbnails fill the view.
             let cap = if v.texture.is_some() && v.player.is_none() { 1.0 } else { f32::MAX };
-            let scale = (area.width() / size.x).min(area.height() / size.y).min(cap);
-            let rect = Rect::from_center_size(area.center(), size * scale);
-            ui.painter().image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            let fit = (area.width() / size.x).min(area.height() / size.y).min(cap);
+            // Eased towards the zoom and pan asked for, so zooming glides.
+            let zoom = ctx.animate_value_with_time(egui::Id::new("viewer zoom"), v.zoom, 0.15);
+            let pan = vec2(
+                ctx.animate_value_with_time(egui::Id::new("viewer pan x"), v.pan.x, 0.15),
+                ctx.animate_value_with_time(egui::Id::new("viewer pan y"), v.pan.y, 0.15),
+            );
+            let rect = Rect::from_center_size(area.center() + pan, size * fit * zoom);
+            ui.painter().with_clip_rect(area).image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            if is_photo {
+                self.viewer.as_mut().unwrap().fitted = size * fit;
+            }
         }
+        let v = self.viewer.as_ref().unwrap();
         if v.failed {
             ui.painter().text(area.center(), Align2::CENTER_CENTER, "Couldn't open this image", FontId::proportional(18.0), Color32::LIGHT_GRAY);
         } else if v.texture.is_none() && v.video_error.is_none() {
             ui.put(Rect::from_center_size(area.center(), vec2(32.0, 32.0)), egui::Spinner::new());
         }
 
-        // Big round arrows on the sides, like Google Photos.
+        // Big round arrows on the sides, like Google Photos (not while zoomed in).
         for (dir, ic, enabled) in [(-1, icon::CARET_LEFT, pos > 0), (1, icon::CARET_RIGHT, pos + 1 < self.order.len())] {
-            if !enabled {
+            if !enabled || zoomed {
                 continue;
             }
             let c = if dir < 0 { pos2(area.left() + 40.0, area.center().y) } else { pos2(area.right() - 40.0, area.center().y) };
@@ -1956,11 +1990,85 @@ impl PhotosApp {
                 self.view_dirty = true;
             }
         }
+        if zoom_out {
+            self.zoom_viewer(1.0, None);
+        }
         if want_close {
             self.viewer = None;
         } else if let Some(p) = go {
             self.open_viewer(p, &ctx);
         }
+    }
+
+    /// Double-click zooms in where the pointer is (or back out), pinch and Ctrl/Cmd+scroll zoom
+    /// around the pointer, and dragging or scrolling moves a zoomed-in photo.
+    fn zoom_input(&mut self, ui: &mut egui::Ui, area: Rect) {
+        let resp = ui.interact(area, ui.id().with("photo"), Sense::click_and_drag());
+        let Some(v) = &mut self.viewer else { return };
+        let zoomed = v.zoom > 1.01;
+        let pointer = resp.hover_pos();
+        if resp.double_clicked() {
+            // In to 2.5x, or to the photo's own pixels if that's closer up.
+            let actual = if v.fitted.x > 0.0 { v.texture.as_ref().map_or(2.5, |t| t.size_vec2().x / v.fitted.x) } else { 2.5 };
+            let target = if zoomed { 1.0 } else { actual.max(2.5) };
+            self.zoom_viewer(target, pointer);
+            return;
+        }
+        let (pinch, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
+        if pinch != 1.0 && resp.hovered() {
+            let z = v.zoom * pinch;
+            self.zoom_viewer(z, pointer);
+            return;
+        }
+        if zoomed {
+            if resp.dragged() {
+                v.pan += resp.drag_delta();
+            }
+            if resp.hovered() {
+                v.pan += scroll;
+            }
+            if resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+        Self::clamp_pan(v, area);
+    }
+
+    /// Zooms to `zoom` (1 = fitted) keeping the point under `at` where it is.
+    fn zoom_viewer(&mut self, zoom: f32, at: Option<Pos2>) {
+        let Some(v) = &mut self.viewer else { return };
+        // Up to 8x the photo's own pixels, and at least 4x the fitted size.
+        let actual = match (&v.texture, v.fitted.x > 0.0) {
+            (Some(t), true) => t.size_vec2().x / v.fitted.x,
+            _ => 1.0,
+        };
+        let zoom = zoom.clamp(1.0, (actual * 8.0).max(4.0));
+        if zoom <= 1.0 {
+            v.zoom = 1.0;
+            v.pan = Vec2::ZERO;
+            return;
+        }
+        if let (Some(p), Some(area)) = (at, v.area) {
+            // The photo's middle is at area.center() + pan; keep the point at `p` fixed.
+            let f = zoom / v.zoom;
+            let c = area.center() + v.pan;
+            v.pan = (p - (p - c) * f) - area.center();
+        } else {
+            v.pan *= zoom / v.zoom;
+        }
+        v.zoom = zoom;
+        if let Some(area) = v.area {
+            Self::clamp_pan(v, area);
+        }
+    }
+
+    /// Keeps a zoomed photo covering the view: it can't be moved past its edges.
+    fn clamp_pan(v: &mut Viewer, area: Rect) {
+        v.area = Some(area);
+        let half = ((v.fitted * v.zoom - area.size()) / 2.0).max(Vec2::ZERO);
+        v.pan = v.pan.clamp(-half, half);
     }
 
     /// Pulls the current video frame into the viewer texture and handles Space.
@@ -4129,7 +4237,8 @@ impl PhotosApp {
         }
         // Trackpad pinch (or Ctrl/Cmd + scroll) resizes the photos, like Photos.app.
         let (zoom, open) = ctx.input(|i| (i.zoom_delta(), i.modifiers.command && i.key_pressed(Key::O)));
-        if zoom != 1.0 {
+        // (In the viewer, pinching zooms the photo instead.)
+        if zoom != 1.0 && self.viewer.is_none() {
             self.row_height = (self.row_height * zoom).clamp(120.0, 360.0);
         }
         if open {
