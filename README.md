@@ -13,6 +13,12 @@ Download from the [latest release](https://github.com/aqibshabbirdev/banana-rs/r
 1. Download `BananaPhotos-<version>-arm64.dmg`, open it, and drag **Banana Photos** to **Applications**. It's signed and notarized by Apple, so it opens with a normal double-click, even offline.
 2. Click the folder button and choose where your photos are. It reads them in place and never moves or changes them.
 
+**Windows (10 or 11, 64-bit)**
+
+1. Download `BananaPhotos-<version>-x64-setup.exe` and run it. It installs for your user only (no admin rights needed), with a Start menu entry and an uninstaller. Or unzip `banana-rs-<version>-windows-x64.zip` anywhere and run `banana-rs.exe` (keep the `models` folder next to it).
+2. The installer isn't signed yet, so Windows SmartScreen may say "Windows protected your PC": click **More info**, then **Run anyway**.
+3. Click the folder button and choose where your photos are. HEIC photos open, and videos show with their length and a thumbnail; they play in your default video player. For Connect phone, allow Banana Photos through the firewall on **Private** networks when Windows asks.
+
 **Linux (Ubuntu 24.04+, Debian 13+; x86_64 or arm64)**
 
 Install with apt. This adds the Banana Photos repository, so `sudo apt upgrade` gets new versions too:
@@ -104,6 +110,10 @@ Without a Developer ID the app is ad-hoc signed, and on another Mac the first la
 Mac extras: trackpad pinch (or Cmd + scroll) resizes photos, Cmd+O opens a folder, and inside an Apple Photos library (`*.photoslibrary`) only the original photos are read, not its thumbnails.
 
 The app icon is drawn by `cargo run --release --example make_icon -- assets/icon.png`.
+
+## Windows
+
+The Windows build is made by GitHub Actions (`.github/workflows/windows.yml`, run by hand or on every push to `production`): it builds with `--no-default-features --features heic` (libheif from vcpkg, linked statically; videos through Media Foundation in `src/video/win.rs` instead of GStreamer), runs the tests, fetches the models, and makes the zip and the installer (`scripts/windows-installer.iss`, Inno Setup). Both are kept as the run's artifact.
 
 ## Mac App Store build
 
