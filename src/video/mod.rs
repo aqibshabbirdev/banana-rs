@@ -266,6 +266,7 @@ fn convert(src: &Path, dst: &Path, progress: &dyn Fn(f32)) -> Result<(), String>
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound if cfg!(windows) => "ffmpeg isn't installed on the computer (winget install ffmpeg)".to_string(),
             std::io::ErrorKind::NotFound => "ffmpeg isn't installed on the computer (sudo apt install ffmpeg)".to_string(),
             _ => e.to_string(),
         })?;
