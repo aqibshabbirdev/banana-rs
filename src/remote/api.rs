@@ -68,6 +68,7 @@ pub fn handle(shared: &Shared, req: &Request, body: &mut dyn Read, media_only: b
         ("POST", "favorite", 3) => match item() {
             Some(it) => {
                 let on = req.param("on") != Some("0");
+                shared.set_favorite(it.id, on);
                 shared.send(Event::Favorite(it.path.clone(), on));
                 Response::json(200, &json!({ "favorite": on }))
             }
@@ -301,6 +302,9 @@ fn upload(shared: &Shared, lib: &Snapshot, phone: &str, req: &Request, body: &mu
     let _ = std::fs::remove_dir(&tmp_dir);
     match result {
         Ok(Some(p)) => {
+            if let Some(photo) = crate::library::read_photo(&p) {
+                shared.add_photo(&photo);
+            }
             shared.send(Event::Uploaded);
             Response::json(200, &json!({ "status": "imported", "name": p.file_name().map(|n| n.to_string_lossy().to_string()) }))
         }

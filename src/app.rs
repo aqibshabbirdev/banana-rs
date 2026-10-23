@@ -26,6 +26,12 @@ use crate::video;
 const MAX_TEXTURES: usize = 3000;
 #[cfg(target_os = "macos")]
 const IC_POLL: f64 = 0.5;
+
+#[cfg(target_os = "macos")]
+const KEEPS_RUNNING: &str =
+    "Banana Photos keeps running in the Dock so your phone can still connect. Quit with ⌘Q, or 🍌 → Quit in the menu bar.";
+#[cfg(not(target_os = "macos"))]
+const KEEPS_RUNNING: &str = "Banana Photos keeps running (minimised) so your phone can still connect. Quit it from Connect phone.";
 const KEEP_TEXTURES: usize = 2000;
 
 // Layout.
@@ -423,6 +429,11 @@ pub struct PhotosApp {
     remote_qr: Option<(String, TextureHandle)>,
     remote_sent: Option<(u64, usize, usize, usize)>,
     remote_rescan_at: Option<f64>,
+    /// macOS: the 🍌 in the menu bar while phones can connect.
+    #[cfg(target_os = "macos")]
+    menubar: Option<crate::menubar::MenuBar>,
+    /// Closing the window really quits (Quit was chosen), instead of minimising it.
+    quitting: bool,
 
     transfer: TransferForm,
     transfer_job: Option<TransferJob>,
@@ -539,6 +550,9 @@ impl PhotosApp {
             remote_qr: None,
             remote_sent: None,
             remote_rescan_at: None,
+            #[cfg(target_os = "macos")]
+            menubar: None,
+            quitting: false,
             transfer: TransferForm::default(),
             transfer_job: None,
             transfer_result: None,
@@ -565,6 +579,24 @@ impl PhotosApp {
         };
         if app.store.phones_enabled {
             app.set_phones_enabled(true, &cc.egui_ctx);
+        }
+        // Dev only: BANANA_TEST_CLOSE=secs closes the window that many seconds in (as the red
+        // button would), and BANANA_TEST_SHOW=secs brings it back (as 🍌 → Open would).
+        #[cfg(debug_assertions)]
+        for (var, show) in [("BANANA_TEST_CLOSE", false), ("BANANA_TEST_SHOW", true)] {
+            if let Some(secs) = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()) {
+                let ctx = cc.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                    if show {
+                        #[cfg(target_os = "macos")]
+                        dispatch_show();
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    ctx.request_repaint();
+                });
+            }
         }
         // Dev only: BANANA_PHONES=1 turns Connect phone on and opens it, and the pairing link
         // goes to stderr, for testing the phone app against a headless build.
@@ -3053,6 +3085,13 @@ impl PhotosApp {
                 Err(e) => self.remote_error = Some(e),
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.menubar = match (&self.remote, objc2::MainThreadMarker::new()) {
+                (Some(_), Some(mtm)) => Some(crate::menubar::MenuBar::new(mtm, "Phones can connect")),
+                _ => None,
+            };
+        }
         if self.store.phones_enabled != on {
             self.store.phones_enabled = on;
             self.store.save();
@@ -3122,6 +3161,15 @@ impl PhotosApp {
             }
             if let Some(e) = &self.remote_error {
                 ui.label(egui::RichText::new(e).color(HEART));
+            }
+            if self.remote.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Closing the window keeps Banana Photos running (minimised), so phones can still connect.").color(TEXT_DIM).size(12.5));
+                    if ui.add(egui::Button::new(egui::RichText::new("Quit Banana Photos").color(ACCENT)).frame(false)).clicked() {
+                        self.quitting = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
             }
             let Some(r) = &self.remote else { return };
 
@@ -3956,6 +4004,17 @@ impl PhotosApp {
 
 impl eframe::App for PhotosApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // With Connect phone on, closing the window minimises it, so phones can still connect;
+        // Quit (⌘Q, the menu bar, or Connect phone's button) really quits.
+        if ctx.input(|i| i.viewport().close_requested()) && self.remote.is_some() && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            if !self.store.told_keeps_running {
+                self.store.told_keeps_running = true;
+                self.store.save();
+                self.notice = Some(KEEPS_RUNNING.to_string());
+            }
+        }
         self.frame += 1;
         self.poll(ctx);
         #[cfg(debug_assertions)]
@@ -4451,4 +4510,19 @@ mod tests {
         assert_eq!(grids.len(), 1);
         assert_eq!(grids[0].decode().unwrap().1, payload);
     }
+}
+
+/// Dev only: runs `menubar::show_window` on the main thread, as the menu item would.
+#[cfg(all(debug_assertions, target_os = "macos"))]
+fn dispatch_show() {
+    extern "C" fn run(_: *mut std::ffi::c_void) {
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            crate::menubar::show_window(mtm);
+        }
+    }
+    unsafe extern "C" {
+        static _dispatch_main_q: std::ffi::c_void;
+        fn dispatch_async_f(queue: *const std::ffi::c_void, context: *mut std::ffi::c_void, work: extern "C" fn(*mut std::ffi::c_void));
+    }
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, std::ptr::null_mut(), run) };
 }

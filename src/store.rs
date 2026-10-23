@@ -31,6 +31,9 @@ pub struct Store {
     /// Phones on this network may connect (Connect phone).
     #[serde(default)]
     pub phones_enabled: bool,
+    /// The note about closing the window minimising it (to keep serving phones) was shown.
+    #[serde(default)]
+    pub told_keeps_running: bool,
     /// Folders of imports kept apart: their photos stay out of the Photos timeline and show
     /// in their own album.
     #[serde(default)]

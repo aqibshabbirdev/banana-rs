@@ -111,6 +111,44 @@ impl Shared {
         self.library.read().unwrap().clone()
     }
 
+    /// Changes the library the phones see right away, without waiting for the app's UI (which
+    /// doesn't run while its window is minimised). The app sends a full snapshot again later.
+    fn edit_library(&self, f: impl FnOnce(&mut Vec<Item>)) {
+        let mut lib = self.library.write().unwrap();
+        let mut items = lib.items.clone();
+        f(&mut items);
+        let by_id = items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
+        *lib = Arc::new(Snapshot { root: lib.root.clone(), items, by_id, version: lib.version + 1 });
+    }
+
+    /// A photo a phone just uploaded, so it shows on the phones before the app re-scans.
+    fn add_photo(&self, photo: &crate::library::Photo) {
+        let item = Item {
+            id: photo_id(&photo.path),
+            path: photo.path.clone(),
+            taken: photo.taken,
+            aspect: photo.aspect,
+            is_video: photo.is_video,
+            duration: photo.duration,
+            size: photo.size,
+            mtime: photo.mtime,
+            favorite: false,
+        };
+        self.edit_library(|items| {
+            items.retain(|it| it.id != item.id);
+            let at = items.partition_point(|it| it.taken > item.taken);
+            items.insert(at, item);
+        });
+    }
+
+    fn set_favorite(&self, id: u64, on: bool) {
+        self.edit_library(|items| {
+            if let Some(it) = items.iter_mut().find(|it| it.id == id) {
+                it.favorite = on;
+            }
+        });
+    }
+
     fn send(&self, e: Event) {
         let _ = self.events.lock().unwrap().send(e);
         self.ctx.request_repaint();
@@ -523,6 +561,13 @@ mod tests {
         let up: serde_json::Value = upload("IMG_0001.jpg").send_bytes(&photo).unwrap().into_json().unwrap();
         assert_eq!(up["status"], "imported");
         assert!(matches!(r.events.try_recv(), Ok(Event::Uploaded)));
+        // The phones see the upload at once, before the app (maybe minimised) re-scans.
+        let after: serde_json::Value = get("/api/photos").call().unwrap().into_json().unwrap();
+        assert_eq!(after["total"], 3);
+        assert!(after["library_version"].as_u64() > list["library_version"].as_u64());
+        a.post(&url(&format!("/api/favorite/{beach}?on=1"))).set("Authorization", &auth).call().unwrap();
+        let fav: serde_json::Value = get("/api/photos").call().unwrap().into_json().unwrap();
+        assert!(fav["items"].as_array().unwrap().iter().any(|i| i["id"] == beach.as_str() && i["favorite"] == true));
         let again: serde_json::Value = upload("IMG_0001.jpg").send_bytes(&photo).unwrap().into_json().unwrap();
         assert_eq!(again["status"], "skipped");
         let has: serde_json::Value = get(&format!("/api/has?name=IMG_0001.jpg&size={}&taken=1700000000", photo.len())).call().unwrap().into_json().unwrap();

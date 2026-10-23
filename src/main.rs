@@ -6,6 +6,8 @@ mod duplicates;
 #[cfg(target_os = "macos")]
 mod imageio;
 mod library;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod people;
 mod remote;
 mod store;
