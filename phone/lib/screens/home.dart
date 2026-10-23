@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 
 import '../api.dart';
+import '../backup.dart';
 import '../library.dart';
 import 'backup.dart';
 import 'photos.dart';
@@ -40,13 +41,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// itself once Banana Photos is opened there.
   Timer? _retry;
 
+  /// Backing this phone up; null until its settings are read.
+  Backup? _backup;
+  bool _backupWasRunning = false;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     library.addListener(_onLibrary);
     library.loadSaved();
+    BackupSettings.load(widget.pairing.fingerprint).then((s) {
+      if (!mounted) return;
+      setState(() => _backup = Backup(api, s)..addListener(_onBackup));
+      // Keeps the background task registered (and up to date) while backup is on.
+      if (s.auto) scheduleBackground(true);
+      if (_status == null) _autoBackup();
+    });
     _connect();
+  }
+
+  /// With automatic backup on, sends what's new once the computer answers.
+  void _autoBackup() {
+    final b = _backup;
+    if (b != null && b.settings.auto && !b.running && _status == null) b.run(onlyNew: true);
+  }
+
+  void _onBackup() {
+    final b = _backup!;
+    // A backup that sent something just finished: show the new photos.
+    if (_backupWasRunning && !b.running && b.sent > 0) library.refresh();
+    _backupWasRunning = b.running;
   }
 
   Future<void> _connect() async {
@@ -60,6 +85,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _status = null);
       await library.refresh(force: true);
       library.startPolling();
+      _autoBackup();
     } on ApiException catch (e) {
       if (e.unpaired) return _unpaired();
       _offline(e.message);
@@ -83,6 +109,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _unpaired() async {
     if (!mounted) return;
+    await _forgetBackup();
     await library.forgetSaved();
     await widget.onUnpaired('${widget.pairing.name} removed this phone. Scan the code on the computer again to reconnect.');
   }
@@ -90,7 +117,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      _status == null ? library.refresh() : _connect();
+      if (_status == null) {
+        library.refresh();
+        _autoBackup();
+      } else {
+        _connect();
+      }
       library.startPolling();
     } else if (state == AppLifecycleState.paused) {
       library.stopPolling();
@@ -98,9 +130,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _forgetBackup() async {
+    _backup?.stop();
+    await scheduleBackground(false);
+    await _backup?.settings.forget();
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _backup?.stop();
+    _backup?.dispose();
     _retry?.cancel();
     library.removeListener(_onLibrary);
     library.dispose();
@@ -122,6 +162,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
     if (ok == true) {
       await cache.emptyCache();
+      await _forgetBackup();
       await library.forgetSaved();
       await widget.onUnpaired(null);
     }
@@ -132,7 +173,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final pages = [
       PhotosPage(library: library, api: api, cache: cache),
       SearchPage(library: library, api: api, cache: cache),
-      BackupPage(api: api, library: library),
+      BackupPage(backup: _backup, computer: widget.pairing.name),
     ];
     return Scaffold(
       appBar: AppBar(
