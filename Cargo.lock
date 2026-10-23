@@ -677,6 +677,7 @@ dependencies = [
  "unicode-normalization",
  "ureq",
  "walkdir",
+ "windows 0.62.2",
  "zeroize",
  "zip",
 ]

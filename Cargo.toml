@@ -51,6 +51,10 @@ gstreamer-pbutils = { version = "0.25", optional = true }
 gstreamer-video = { version = "0.25", optional = true }
 
 # Video on macOS goes through AVFoundation (hardware decoding, audio), nothing to install.
+# Windows: video thumbnails through Media Foundation (see video/win.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
+
 # glibc's malloc settings (see main.rs).
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"

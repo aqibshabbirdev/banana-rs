@@ -206,3 +206,21 @@ fn to_color_image(img: DynamicImage) -> ColorImage {
     let rgba = img.to_rgba8();
     ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HEIC opens on every platform (ImageIO on macOS, libheif elsewhere): tests/data/wide.heic
+    /// is 96×64, blue on the left, red on the right.
+    #[test]
+    fn heic_opens() {
+        // As main() does.
+        #[cfg(all(feature = "heic", not(target_os = "macos")))]
+        libheif_rs::integration::image::register_all_decoding_hooks();
+        let img = decode(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wide.heic"), 4096).expect("HEIC decodes").to_rgb8();
+        assert_eq!(img.dimensions(), (96, 64));
+        let (left, right) = (img.get_pixel(20, 32).0, img.get_pixel(76, 32).0);
+        assert!(left[2] > 150 && left[0] < 100 && right[0] > 150 && right[2] < 100, "{left:?} {right:?}");
+    }
+}
