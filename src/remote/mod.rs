@@ -695,6 +695,46 @@ pub fn pinned_agent(fingerprint: &str) -> ureq::Agent {
     ureq::AgentBuilder::new().tls_config(Arc::new(config)).timeout_connect(Duration::from_secs(5)).build()
 }
 
+/// Takes whatever certificate it's shown and notes its SHA-256: for adding a computer by its
+/// address when it can't be found on the network (as with mDNS, the six digits pair them).
+#[derive(Debug)]
+struct Noted(Mutex<Option<String>>, Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for Noted {
+    fn verify_server_cert(&self, cert: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        *self.0.lock().unwrap() = Some(hex(&Sha256::digest(cert.as_ref())));
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.1.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.1.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.1.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The certificate fingerprint of the Banana Photos at `host:port`.
+pub fn fingerprint_at(host: &str, port: u16) -> Result<String, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let noted = Arc::new(Noted(Mutex::new(None), provider.clone()));
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(noted.clone())
+        .with_no_client_auth();
+    let agent = ureq::AgentBuilder::new().tls_config(Arc::new(config)).timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(10)).build();
+    match agent.get(&format!("https://{host}:{port}/api/info")).call() {
+        Ok(_) | Err(ureq::Error::Status(..)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let fp = noted.0.lock().unwrap().clone();
+    fp.ok_or_else(|| "no certificate".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +787,8 @@ mod tests {
         r.set_library(snapshot(Some(root.clone()), &photos, &store, &people, &crate::people::Index::default()));
         let url = |p: &str| format!("https://127.0.0.1:{}{p}", r.shared.port);
         let a = agent(&r.shared.fingerprint);
+        // Added by its address, a computer's fingerprint is read from it.
+        assert_eq!(fingerprint_at("127.0.0.1", r.shared.port).as_deref(), Ok(r.shared.fingerprint.as_str()));
 
         // A different certificate is refused by the phone; no token, no library.
         assert!(agent(&"0".repeat(64)).get(&url("/api/info")).call().is_err());

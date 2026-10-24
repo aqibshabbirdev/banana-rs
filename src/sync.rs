@@ -250,7 +250,15 @@ fn url(host: &str, port: u16, path: &str) -> String {
 }
 
 /// Pairs with `found` using the six digits it shows under Connect.
+/// One typed in by its address ("192.168.1.11", or with ":port") goes without a fingerprint,
+/// which is read from it here.
 pub fn pair(found: &Found, pin: &str, my_name: &str) -> Result<Computer, String> {
+    let mut found = found.clone();
+    if found.fingerprint.is_empty() {
+        let host = found.hosts.first().cloned().unwrap_or_default();
+        found.fingerprint = crate::remote::fingerprint_at(&host, found.port).map_err(|e| format!("Couldn't reach {host} ({e})"))?;
+    }
+    let found = &found;
     let agent = crate::remote::pinned_agent(&found.fingerprint);
     let mut last = String::from("no address");
     for host in &found.hosts {

@@ -463,6 +463,8 @@ pub struct PhotosApp {
     sync_next: f64,
     finding: Option<Receiver<Vec<sync::Found>>>,
     found: Option<Vec<sync::Found>>,
+    /// An address typed in for a computer that isn't found.
+    address: String,
     /// The computer being paired, the six digits typed, and how pairing went.
     pairing: Option<(sync::Found, String, Option<String>)>,
     pairing_rx: Option<Receiver<Result<sync::Computer, String>>>,
@@ -599,6 +601,7 @@ impl PhotosApp {
             sync_next: 8.0,
             finding: None,
             found: None,
+            address: String::new(),
             pairing: None,
             pairing_rx: None,
             quitting: false,
@@ -3658,6 +3661,22 @@ impl PhotosApp {
                     }
                 });
             }
+            // mDNS doesn't get through every network or firewall: its address works too, from
+            // the line under the switch there ("192.168.1.11 · port 47820").
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Not in the list? Its address:").color(TEXT_DIM));
+                let field = ui.add(egui::TextEdit::singleline(&mut self.address).desired_width(150.0).hint_text("192.168.1.11"));
+                let typed = self.address.trim().to_string();
+                let go = ui.add_enabled(!typed.is_empty(), egui::Button::new("Next"));
+                if go.clicked() || (field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !typed.is_empty()) {
+                    let (host, port) = match typed.rsplit_once(':') {
+                        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+                        _ => (typed.clone(), remote::PORT),
+                    };
+                    let f = sync::Found { name: host.clone(), fingerprint: String::new(), hosts: vec![host], port };
+                    self.pairing = Some((f, String::new(), None));
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.add(egui::Button::new(egui::RichText::new("Look again").color(ACCENT)).frame(false)).clicked() {
                     self.found = None;
@@ -3781,7 +3800,7 @@ impl PhotosApp {
                 ui.label(egui::RichText::new(format!("{} · {at} · port {}", r.shared.name, remote::PORT)).color(TEXT_DIM).size(12.5));
                 if cfg!(target_os = "linux") {
                     ui.label(
-                        egui::RichText::new(format!("Phone can't connect? Allow the ports in the firewall: sudo ufw allow {}:{}/tcp", remote::PORT, remote::MEDIA_PORT))
+                        egui::RichText::new(format!("Phone or computer can't connect? Allow the ports in the firewall: sudo ufw allow {}:{}/tcp && sudo ufw allow 5353/udp", remote::PORT, remote::MEDIA_PORT))
                             .color(TEXT_DIM)
                             .size(12.5),
                     );
