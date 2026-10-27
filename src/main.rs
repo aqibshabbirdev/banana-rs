@@ -57,7 +57,30 @@ fn main() -> eframe::Result {
     // The 🍌 in the title bar and taskbar (macOS takes it from the app bundle).
     #[cfg(not(target_os = "macos"))]
     let viewport = viewport.with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default());
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let mut options = eframe::NativeOptions { viewport, ..Default::default() };
+    // Windows: Direct3D 12 instead of OpenGL. Without a GPU driver (the Microsoft Store's test
+    // machines, VMs, Remote Desktop) Windows only has OpenGL 1.1, so the window never opened and
+    // the app quit at launch; Direct3D falls back to Windows' software renderer.
+    #[cfg(windows)]
+    {
+        options.renderer = eframe::Renderer::Wgpu;
+    }
+    // BANANA_RENDERER=glow|wgpu picks one (glow is the only one built in off Windows).
+    match std::env::var("BANANA_RENDERER").as_deref() {
+        Ok("glow") => options.renderer = eframe::Renderer::Glow,
+        #[cfg(windows)]
+        Ok("wgpu") => options.renderer = eframe::Renderer::Wgpu,
+        _ => {}
+    }
 
-    eframe::run_native("banana-rs", options, Box::new(|cc| Ok(Box::new(app::PhotosApp::new(cc, start)))))
+    let result = eframe::run_native("banana-rs", options, Box::new(|cc| Ok(Box::new(app::PhotosApp::new(cc, start)))));
+    // A window app has nowhere to show why it couldn't start, so it's written down.
+    if let Err(e) = &result {
+        eprintln!("Banana Photos couldn't start: {e}");
+        if let Some(dir) = store::data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("startup-error.txt"), format!("{e}\n"));
+        }
+    }
+    result
 }

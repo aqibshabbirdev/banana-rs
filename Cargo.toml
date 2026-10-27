@@ -53,6 +53,9 @@ gstreamer-video = { version = "0.25", optional = true }
 # Video on macOS goes through AVFoundation (hardware decoding, audio), nothing to install.
 # Windows: video thumbnails through Media Foundation (see video/win.rs).
 [target.'cfg(windows)'.dependencies]
+# Direct3D 12 through wgpu: it also runs on PCs and VMs without a GPU driver (WARP), where the
+# default OpenGL renderer can't open a window (see main.rs).
+eframe = { version = "0.31", features = ["wgpu"] }
 windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com"] }
 
 # glibc's malloc settings (see main.rs).

@@ -38,6 +38,26 @@ jobs:
       - name: Models
         shell: bash
         run: scripts/fetch-models.sh dist/win/models
+      # The runner has no GPU, like the Microsoft Store's test machines: the app has to open its
+      # window and stay up there. OpenGL is tried too, only to show what it does on such a PC.
+      - name: Launch
+        run: |
+          function Launch($renderer) {
+            $data = "$env:RUNNER_TEMP\launch-$renderer"
+            New-Item -ItemType Directory -Force "$data\lib" | Out-Null
+            Set-Content "$data\last_folder" "$data\lib" -NoNewline
+            $env:BANANA_DATA = $data
+            $env:BANANA_RENDERER = $renderer
+            $p = Start-Process target/release/banana-rs.exe -PassThru
+            Start-Sleep 20
+            $up = -not $p.HasExited
+            if ($up) { Stop-Process $p.Id -Force } else { Write-Host "$renderer exited with $($p.ExitCode)" }
+            if (Test-Path "$data\startup-error.txt") { Write-Host "${renderer}: $(Get-Content "$data\startup-error.txt")" }
+            Write-Host "$renderer stayed up: $up"
+            return $up
+          }
+          Launch glow | Out-Null
+          if (-not (Launch wgpu)) { Write-Error "the app didn't stay open"; exit 1 }
       - name: Package (zip and installer)
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
@@ -75,6 +95,14 @@ jobs:
           if (-not $installed) { Write-Error "the package didn't install"; exit 1 }
           Write-Host "Installed $($installed.PackageFullName) at $($installed.InstallLocation)"
           Get-ChildItem $installed.InstallLocation | Format-Table Name, Length
+          # Started the way the Store starts it, it has to stay up.
+          Start-Process "shell:AppsFolder\$($installed.PackageFamilyName)!BananaPhotos"
+          Start-Sleep 20
+          $p = Get-Process banana-rs -ErrorAction SilentlyContinue
+          if (-not $p) { Write-Error "the packaged app didn't stay open"; exit 1 }
+          Write-Host "Packaged app running (pid $($p.Id))"
+          Stop-Process -Name banana-rs -Force
+          Start-Sleep 2
           Remove-AppxPackage $installed.PackageFullName
       - uses: actions/upload-artifact@v4
         with:
