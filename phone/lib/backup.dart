@@ -2,6 +2,7 @@
 // with /api/has first, so only what the computer doesn't have is sent. With automatic backup on,
 // it runs when the app opens and, on Android, now and then in the background (WorkManager, on
 // Wi-Fi); those runs only look at what was added or changed since the last finished pass.
+// Files over [bigBytes] (long videos) aren't sent by themselves: they wait for a yes in the app.
 
 import 'dart:async';
 import 'dart:convert';
@@ -14,13 +15,33 @@ import 'package:workmanager/workmanager.dart';
 
 import 'api.dart';
 
+/// Bigger than this, a file waits to be sent until it's asked for (a 2 GB film stalls a backup).
+const bigBytes = 500 * 1024 * 1024;
+
+/// A big file not on the computer yet, waiting to be sent or skipped.
+class Waiting {
+  Waiting(this.id, this.name, this.size);
+  Waiting.fromJson(Map<String, dynamic> j)
+      : id = j['id'] as String,
+        name = j['name'] as String? ?? '',
+        size = j['size'] as int? ?? 0;
+
+  final String id;
+  final String name;
+  final int size;
+
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'size': size};
+}
+
 /// Backup settings and where the last pass got to, kept per computer.
 class BackupSettings {
   BackupSettings._(this._file, Map<String, dynamic> j)
       : auto = j['auto'] as bool? ?? false,
         doneUntil = j['done_until'] as int?,
         lastRun = j['last_run'] as int?,
-        lastSent = j['last_sent'] as int? ?? 0;
+        lastSent = j['last_sent'] as int? ?? 0,
+        waiting = [for (final w in j['waiting'] as List? ?? []) Waiting.fromJson(w as Map<String, dynamic>)],
+        notBig = {...(j['not_big'] as List? ?? []).cast<String>()};
 
   final File _file;
   bool auto;
@@ -33,6 +54,10 @@ class BackupSettings {
   int? lastRun;
   int lastSent;
 
+  /// Big files found but not sent, and the ones it was told not to send (by asset id).
+  final List<Waiting> waiting;
+  final Set<String> notBig;
+
   static Future<BackupSettings> load(String fingerprint) async {
     final f = File('${(await getApplicationSupportDirectory()).path}/backup-${fingerprint.substring(0, 12)}.json');
     Map<String, dynamic> j = {};
@@ -44,7 +69,14 @@ class BackupSettings {
 
   Future<void> save() async {
     await _file.parent.create(recursive: true);
-    await _file.writeAsString(jsonEncode({'auto': auto, 'done_until': doneUntil, 'last_run': lastRun, 'last_sent': lastSent}));
+    await _file.writeAsString(jsonEncode({
+      'auto': auto,
+      'done_until': doneUntil,
+      'last_run': lastRun,
+      'last_sent': lastSent,
+      'waiting': [for (final w in waiting) w.toJson()],
+      'not_big': notBig.toList(),
+    }));
   }
 
   Future<void> forget() async {
@@ -97,7 +129,7 @@ class Backup extends ChangeNotifier {
   bool _stop = false;
 
   /// This pass: how many it looks at, and what happened to them.
-  int total = 0, checked = 0, sent = 0, skipped = 0, failed = 0;
+  int total = 0, checked = 0, sent = 0, skipped = 0, failed = 0, held = 0;
   String current = '';
   double fileProgress = 0;
   final List<String> errors = [];
@@ -107,18 +139,24 @@ class Backup extends ChangeNotifier {
 
   /// Runs a pass. [onlyNew] looks only at what changed since the last finished pass (all of
   /// them the first time); [limit] stops it after that long (background tasks get ~10 minutes).
-  Future<void> run({bool onlyNew = false, Duration? limit}) async {
+  /// [big] sends the big files waiting instead (they were asked for).
+  Future<void> run({bool onlyNew = false, Duration? limit, bool big = false}) async {
     if (running) return;
     final lock = await _Lock.open();
     if (!await lock.take()) return; // The other one (app or background) is at it.
     final started = DateTime.now();
     running = true;
     _stop = false;
-    total = checked = sent = skipped = failed = 0;
+    total = checked = sent = skipped = failed = held = 0;
     errors.clear();
     done = null;
     notifyListeners();
     try {
+      if (big) {
+        await _sendWaiting();
+        done = _stop ? 'Stopped.' : 'Done. ${sent == 0 ? 'Nothing was sent.' : '$sent sent to the computer.'}';
+        return;
+      }
       final since = onlyNew ? settings.doneUntil : null;
       // What arrived since then (with a day of slack for clocks): on Android the create time is
       // when the file was added to the phone; on iOS adding one also sets its modification date.
@@ -151,7 +189,8 @@ class Backup extends ChangeNotifier {
       settings.lastRun = DateTime.now().millisecondsSinceEpoch;
       settings.lastSent = sent;
       await settings.save();
-      done = finished ? 'Done. ${sent == 0 ? 'Everything was already on the computer.' : '$sent sent to the computer.'}' : 'Stopped.';
+      final wait = settings.waiting.isEmpty ? '' : ' ${settings.waiting.length} big ${settings.waiting.length == 1 ? 'file waits' : 'files wait'} for you below.';
+      done = finished ? 'Done. ${sent == 0 ? 'Everything else was already on the computer.' : '$sent sent to the computer.'}$wait' : 'Stopped.';
     } catch (e) {
       errors.add('$e');
       done = 'Stopped.';
@@ -161,6 +200,35 @@ class Backup extends ChangeNotifier {
       await lock.release();
       notifyListeners();
     }
+  }
+
+  /// The big files asked for, one by one; each leaves the list once it's on the computer.
+  Future<void> _sendWaiting() async {
+    total = settings.waiting.length;
+    notifyListeners();
+    for (final w in [...settings.waiting]) {
+      if (_stop) break;
+      final a = await AssetEntity.fromId(w.id);
+      if (a == null) {
+        // Deleted from the phone since.
+        settings.waiting.removeWhere((x) => x.id == w.id);
+        checked++;
+        continue;
+      }
+      if (await _one(a, big: true)) settings.waiting.removeWhere((x) => x.id == w.id);
+      await settings.save();
+    }
+    settings.lastRun = DateTime.now().millisecondsSinceEpoch;
+    settings.lastSent = sent;
+    await settings.save();
+  }
+
+  /// Leaves the big files waiting off the computer, now and in later backups.
+  Future<void> skipWaiting() async {
+    settings.notBig.addAll(settings.waiting.map((w) => w.id));
+    settings.waiting.clear();
+    await settings.save();
+    notifyListeners();
   }
 
   void stop() {
@@ -182,7 +250,9 @@ class Backup extends ChangeNotifier {
     super.dispose();
   }
 
-  Future<void> _one(AssetEntity a) async {
+  /// Backs one up; true once the computer has it. A big one is put on the waiting list
+  /// instead, unless [big].
+  Future<bool> _one(AssetEntity a, {bool big = false}) async {
     try {
       final name = await a.titleAsync;
       final taken = wallClockSeconds(a.createDateTime);
@@ -195,12 +265,29 @@ class Backup extends ChangeNotifier {
       final size = await file.length();
       if (await api.has(name, size, taken)) {
         skipped++;
+        if (settings.waiting.any((w) => w.id == a.id)) {
+          settings.waiting.removeWhere((w) => w.id == a.id);
+          await settings.save();
+        }
+        return true;
+      } else if (size > bigBytes && !big) {
+        if (settings.notBig.contains(a.id)) {
+          skipped++;
+        } else {
+          held++;
+          if (!settings.waiting.any((w) => w.id == a.id)) {
+            settings.waiting.add(Waiting(a.id, name, size));
+            await settings.save();
+          }
+        }
+        return false;
       } else {
         final status = await api.upload(file, name, taken, progress: (s, t) {
           fileProgress = t == 0 ? 0 : s / t;
           notifyListeners();
         });
         status == 'imported' ? sent++ : skipped++;
+        return true;
       }
     } on ApiException catch (e) {
       failed++;
@@ -213,6 +300,7 @@ class Backup extends ChangeNotifier {
       checked++;
       notifyListeners();
     }
+    return false;
   }
 }
 

@@ -84,7 +84,8 @@ class _BackupPageState extends State<BackupPage> {
       const SizedBox(height: 8),
       Text(
         "Copies this phone's photos and videos to ${widget.computer}, into Imported, in year and month folders. "
-        'Ones already there are skipped, so the next backup only sends new ones.',
+        'Ones already there are skipped, so the next backup only sends new ones. '
+        'Files over 500 MB, like long videos, wait until you say to send them.',
         style: t.bodyMedium?.copyWith(color: Colors.white70),
       ),
       const SizedBox(height: 20),
@@ -102,7 +103,7 @@ class _BackupPageState extends State<BackupPage> {
 
   Widget _status(BuildContext context, Backup b, PermissionState p) {
     final t = Theme.of(context).textTheme;
-    final counts = '${b.checked} of ${b.total} checked · ${b.sent} sent · ${b.skipped} already there${b.failed > 0 ? ' · ${b.failed} failed' : ''}';
+    final counts = '${b.checked} of ${b.total} checked · ${b.sent} sent · ${b.skipped} already there${b.held > 0 ? ' · ${b.held} waiting' : ''}${b.failed > 0 ? ' · ${b.failed} failed' : ''}';
     final last = b.settings.lastRun;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text('$_onPhone photos and videos on this phone${p == PermissionState.limited ? ' (only the ones you allowed)' : ''}.', style: t.bodyLarge),
@@ -141,6 +142,10 @@ class _BackupPageState extends State<BackupPage> {
         const SizedBox(height: 8),
         OutlinedButton(onPressed: b.stop, child: const Text('Stop')),
       ],
+      if (b.settings.waiting.isNotEmpty && !b.running) ...[
+        const SizedBox(height: 16),
+        _waiting(context, b),
+      ],
       if (b.done != null) ...[
         const SizedBox(height: 12),
         Text(b.done!, style: t.bodyLarge),
@@ -149,6 +154,34 @@ class _BackupPageState extends State<BackupPage> {
       for (final e in b.errors.take(10)) Text(e, style: t.bodySmall?.copyWith(color: Theme.of(context).colorScheme.error)),
     ]);
   }
+
+  /// The big files a backup left for the user to decide on.
+  Widget _waiting(BuildContext context, Backup b) {
+    final t = Theme.of(context).textTheme;
+    final w = b.settings.waiting;
+    final total = w.fold<int>(0, (n, x) => n + x.size);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('${w.length} ${w.length == 1 ? 'file' : 'files'} over 500 MB not sent (${_size(total)})', style: t.titleMedium),
+          const SizedBox(height: 4),
+          Text('Big videos take a long time to send. Send them now, or leave them off the computer.', style: t.bodySmall?.copyWith(color: Colors.white70)),
+          const SizedBox(height: 8),
+          for (final x in w.take(5)) Text('${x.name} · ${_size(x.size)}', style: t.bodySmall, overflow: TextOverflow.ellipsis),
+          if (w.length > 5) Text('and ${w.length - 5} more', style: t.bodySmall),
+          const SizedBox(height: 12),
+          Row(children: [
+            FilledButton(onPressed: () => b.run(big: true), child: const Text('Send them')),
+            const SizedBox(width: 8),
+            TextButton(onPressed: b.skipWaiting, child: const Text("Don't send")),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  String _size(int bytes) => bytes >= 1 << 30 ? '${(bytes / (1 << 30)).toStringAsFixed(1)} GB' : '${(bytes / (1 << 20)).round()} MB';
 
   String _when(DateTime d) {
     final now = DateTime.now();
