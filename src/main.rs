@@ -64,6 +64,7 @@ fn main() -> eframe::Result {
     #[cfg(windows)]
     {
         options.renderer = eframe::Renderer::Wgpu;
+        options.wgpu_options = windows_wgpu();
     }
     // BANANA_RENDERER=glow|wgpu picks one (glow is the only one built in off Windows).
     match std::env::var("BANANA_RENDERER").as_deref() {
@@ -83,4 +84,29 @@ fn main() -> eframe::Result {
         }
     }
     result
+}
+
+/// Direct3D 12 (or Vulkan) on a GPU when there is one, else Windows' software renderer (WARP),
+/// which wgpu's own choice passes over: on a PC without a GPU driver it found nothing.
+#[cfg(windows)]
+fn windows_wgpu() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+    use eframe::wgpu;
+    let mut setup = WgpuSetupCreateNew::default();
+    setup.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+    setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
+        let usable: Vec<&wgpu::Adapter> = adapters.iter().filter(|a| surface.is_none_or(|s| a.is_surface_supported(s))).collect();
+        // A real GPU first (a discrete one before an integrated one), software last.
+        let rank = |a: &&wgpu::Adapter| match a.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => 2,
+            wgpu::DeviceType::Cpu => 3,
+        };
+        usable.iter().min_by_key(rank).map(|a| (*a).clone()).ok_or_else(|| {
+            let found: Vec<String> = adapters.iter().map(|a| format!("{} ({:?}, {:?})", a.get_info().name, a.get_info().device_type, a.get_info().backend)).collect();
+            format!("no graphics adapter can draw the window; found: {}", if found.is_empty() { "none".into() } else { found.join(", ") })
+        })
+    }));
+    WgpuConfiguration { wgpu_setup: WgpuSetup::CreateNew(setup), ..Default::default() }
 }
