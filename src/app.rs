@@ -4919,6 +4919,10 @@ fn human_bytes(b: u64) -> String {
 }
 
 fn last_folder_file() -> Option<PathBuf> {
+    // A test run with its own data folder (BANANA_DATA) keeps its own library folder too.
+    if let Some(dir) = std::env::var_os("BANANA_DATA") {
+        return Some(PathBuf::from(dir).join("last_folder"));
+    }
     Some(dirs::config_dir()?.join("banana-rs").join("last_folder"))
 }
 
