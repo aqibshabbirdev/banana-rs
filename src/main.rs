@@ -97,7 +97,7 @@ fn windows_wgpu() -> eframe::egui_wgpu::WgpuConfiguration {
     setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
         let usable: Vec<&wgpu::Adapter> = adapters.iter().filter(|a| surface.is_none_or(|s| a.is_surface_supported(s))).collect();
         // A real GPU first (a discrete one before an integrated one), software last.
-        let rank = |a: &&wgpu::Adapter| match a.get_info().device_type {
+        let rank = |a: &&&wgpu::Adapter| match a.get_info().device_type {
             wgpu::DeviceType::DiscreteGpu => 0,
             wgpu::DeviceType::IntegratedGpu => 1,
             wgpu::DeviceType::VirtualGpu | wgpu::DeviceType::Other => 2,
