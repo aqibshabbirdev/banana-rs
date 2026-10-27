@@ -93,3 +93,7 @@ lto = "thin"
 rqrr = "0.11.0"
 # Only for examples/make_doc_prompts.rs, which precomputes the Documents prompt embeddings.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# winit without the private blur API the Mac App Store rejects (vendor/winit, see set_blur).
+[patch.crates-io]
+winit = { path = "vendor/winit" }
