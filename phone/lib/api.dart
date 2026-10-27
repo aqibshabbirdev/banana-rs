@@ -89,6 +89,26 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
+/// Thrown by a send that was stopped.
+class Cancelled implements Exception {
+  const Cancelled();
+
+  @override
+  String toString() => 'Stopped';
+}
+
+/// Stops a send part-way: [cancel] drops its connection at once, even while it waits on the
+/// network.
+class Cancel {
+  bool cancelled = false;
+  void Function()? _abort;
+
+  void cancel() {
+    cancelled = true;
+    _abort?.call();
+  }
+}
+
 /// An HTTP client that accepts only the certificate with this SHA-256 (no CA is trusted).
 HttpClient pinnedHttpClient(String fingerprint) {
   final client = HttpClient(context: SecurityContext(withTrustedRoots: false))
@@ -267,24 +287,35 @@ class Api {
   Future<bool> has(String name, int size, int taken) async =>
       (await getJson('/api/has', {'name': name, 'size': '$size', 'taken': '$taken'}))['have'] == true;
 
-  /// Sends one file from the phone; returns "imported" or "skipped".
-  Future<String> upload(File file, String name, int taken, {void Function(int sent, int total)? progress}) async {
+  /// Sends one file from the phone; returns "imported" or "skipped". [cancel] drops the
+  /// connection mid-file and makes it throw [Cancelled] (the computer throws the part away).
+  Future<String> upload(File file, String name, int taken,
+      {void Function(int sent, int total)? progress, Cancel? cancel}) async {
     final length = await file.length();
     final req = await _io.openUrl('POST', uri('/api/upload', {'name': name, 'taken': '$taken'}));
     req.headers.set('Authorization', 'Bearer ${pairing.token}');
     req.headers.contentType = ContentType.binary;
     req.contentLength = length;
-    var sent = 0;
-    await req.addStream(file.openRead().map((chunk) {
-      sent += chunk.length;
-      progress?.call(sent, length);
-      return chunk;
-    }));
-    final resp = await req.close();
-    final text = await resp.transform(utf8.decoder).join();
-    final j = text.isEmpty ? <String, dynamic>{} : jsonDecode(text) as Map<String, dynamic>;
-    if (resp.statusCode != 200) throw ApiException(resp.statusCode, (j['error'] as String?) ?? 'Error ${resp.statusCode}');
-    return j['status'] as String;
+    cancel?._abort = () => req.abort(const Cancelled());
+    try {
+      if (cancel?.cancelled ?? false) throw const Cancelled();
+      var sent = 0;
+      await req.addStream(file.openRead().map((chunk) {
+        sent += chunk.length;
+        progress?.call(sent, length);
+        return chunk;
+      }));
+      final resp = await req.close();
+      final text = await resp.transform(utf8.decoder).join();
+      final j = text.isEmpty ? <String, dynamic>{} : jsonDecode(text) as Map<String, dynamic>;
+      if (resp.statusCode != 200) throw ApiException(resp.statusCode, (j['error'] as String?) ?? 'Error ${resp.statusCode}');
+      return j['status'] as String;
+    } catch (e) {
+      if (cancel?.cancelled ?? false) throw const Cancelled();
+      rethrow;
+    } finally {
+      cancel?._abort = null;
+    }
   }
 
   /// Downloads a photo or video to [to]: the file as stored ([original]), or the photo as a

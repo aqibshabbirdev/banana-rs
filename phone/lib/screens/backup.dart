@@ -181,7 +181,8 @@ class _BackupPageState extends State<BackupPage> {
     );
   }
 
-  String _size(int bytes) => bytes >= 1 << 30 ? '${(bytes / (1 << 30)).toStringAsFixed(1)} GB' : '${(bytes / (1 << 20)).round()} MB';
+  // In the phone's own units (1 MB = 1,000,000 bytes), as its Files app shows them.
+  String _size(int bytes) => bytes >= 1e9 ? '${(bytes / 1e9).toStringAsFixed(1)} GB' : '${(bytes / 1e6).round()} MB';
 
   String _when(DateTime d) {
     final now = DateTime.now();

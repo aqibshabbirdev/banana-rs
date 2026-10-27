@@ -16,7 +16,8 @@ import 'package:workmanager/workmanager.dart';
 import 'api.dart';
 
 /// Bigger than this, a file waits to be sent until it's asked for (a 2 GB film stalls a backup).
-const bigBytes = 500 * 1024 * 1024;
+/// In the phone's own megabytes (1,000,000 bytes), so "511 MB" in its Files app counts as big.
+const bigBytes = 500 * 1000 * 1000;
 
 /// A big file not on the computer yet, waiting to be sent or skipped.
 class Waiting {
@@ -128,6 +129,9 @@ class Backup extends ChangeNotifier {
   bool running = false;
   bool _stop = false;
 
+  /// Stops the file being sent now, not just before the next one.
+  Cancel? _sending;
+
   /// This pass: how many it looks at, and what happened to them.
   int total = 0, checked = 0, sent = 0, skipped = 0, failed = 0, held = 0;
   String current = '';
@@ -233,6 +237,7 @@ class Backup extends ChangeNotifier {
 
   void stop() {
     _stop = true;
+    _sending?.cancel();
     notifyListeners();
   }
 
@@ -282,13 +287,21 @@ class Backup extends ChangeNotifier {
         }
         return false;
       } else {
-        final status = await api.upload(file, name, taken, progress: (s, t) {
-          fileProgress = t == 0 ? 0 : s / t;
-          notifyListeners();
-        });
-        status == 'imported' ? sent++ : skipped++;
-        return true;
+        if (_stop) return false;
+        final cancel = _sending = Cancel();
+        try {
+          final status = await api.upload(file, name, taken, cancel: cancel, progress: (s, t) {
+            fileProgress = t == 0 ? 0 : s / t;
+            notifyListeners();
+          });
+          status == 'imported' ? sent++ : skipped++;
+          return true;
+        } finally {
+          _sending = null;
+        }
       }
+    } on Cancelled {
+      // Stopped part-way: not a failure, and the computer drops what it got.
     } on ApiException catch (e) {
       failed++;
       errors.add(e.message);
